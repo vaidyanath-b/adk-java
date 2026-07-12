@@ -50,11 +50,63 @@ public class LiveTokenTrackingPluginTest {
   }
 
   private static Event eventWithUsage(GenerateContentResponseUsageMetadata usageMetadata) {
+    return eventWithUsage(usageMetadata, /* partial= */ null);
+  }
+
+  private static Event eventWithUsage(
+      GenerateContentResponseUsageMetadata usageMetadata, Boolean partial) {
     return Event.builder()
         .id(Event.generateEventId())
         .author("model")
+        .partial(partial)
         .usageMetadata(usageMetadata)
         .build();
+  }
+
+  @Test
+  public void onEventCallback_ignoresCumulativePartialsAndCountsFinalOnly() {
+    // Mirrors observed SSE streaming: partials carry a cumulative running snapshot (candidates
+    // 12 -> 40 -> 43) and the final non-partial event repeats the authoritative total. Summing the
+    // partials would multiply the count, so only the final event is counted.
+    plugin
+        .onEventCallback(
+            mockInvocationContext,
+            eventWithUsage(
+                GenerateContentResponseUsageMetadata.builder()
+                    .promptTokenCount(32)
+                    .candidatesTokenCount(12)
+                    .totalTokenCount(435)
+                    .build(),
+                /* partial= */ true))
+        .blockingGet();
+    plugin
+        .onEventCallback(
+            mockInvocationContext,
+            eventWithUsage(
+                GenerateContentResponseUsageMetadata.builder()
+                    .promptTokenCount(32)
+                    .candidatesTokenCount(43)
+                    .totalTokenCount(466)
+                    .build(),
+                /* partial= */ true))
+        .blockingGet();
+    plugin
+        .onEventCallback(
+            mockInvocationContext,
+            eventWithUsage(
+                GenerateContentResponseUsageMetadata.builder()
+                    .promptTokenCount(32)
+                    .candidatesTokenCount(43)
+                    .totalTokenCount(466)
+                    .build(),
+                /* partial= */ null))
+        .blockingGet();
+
+    LiveTokenTrackingPlugin.Usage usage = plugin.usageFor(INVOCATION_ID);
+    assertThat(usage).isNotNull();
+    assertThat(usage.promptTokenCount()).isEqualTo(32);
+    assertThat(usage.candidatesTokenCount()).isEqualTo(43);
+    assertThat(usage.totalTokenCount()).isEqualTo(466);
   }
 
   @Test

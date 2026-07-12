@@ -31,11 +31,20 @@ import org.slf4j.LoggerFactory;
  * Plugin that tracks token usage emitted during a run, including bidirectional (BIDI) live sessions
  * such as Gemini Live audio.
  *
- * <p>Token usage for a live session arrives on dedicated {@code usageMetadata} events (separate
- * from the audio/content events) via {@link #onEventCallback}. Gemini Live emits one such event per
- * turn, each reporting that turn's own usage rather than a session-cumulative running total, so
- * this plugin sums the per-turn values to obtain session totals. When the run completes, {@link
- * #afterRunCallback} logs the final totals and releases the per-invocation state.
+ * <p>Usage arrives on {@code usageMetadata} events via {@link #onEventCallback}, but the shape
+ * differs by mode:
+ *
+ * <ul>
+ *   <li><b>SSE streaming</b>: each streamed <em>partial</em> event carries a cumulative
+ *       usageMetadata snapshot of the in-progress model call, followed by a final non-partial event
+ *       with the authoritative total. Summing the partials would multiply the count.
+ *   <li><b>BIDI live</b>: one non-partial usageMetadata event per turn, each reporting that turn's
+ *       own usage (not a session-cumulative total).
+ * </ul>
+ *
+ * <p>To handle both correctly, this plugin ignores partial events and sums the totals from
+ * non-partial events across all model calls and turns of the invocation. When the run completes,
+ * {@link #afterRunCallback} logs the final totals and releases the per-invocation state.
  *
  * <p>Register it on the runner like any other plugin to get per-session token accounting for both
  * live and non-live runs.
@@ -56,6 +65,14 @@ public final class LiveTokenTrackingPlugin extends BasePlugin {
 
   @Override
   public Maybe<Event> onEventCallback(InvocationContext invocationContext, Event event) {
+    // Skip partial (streaming) events. In SSE streaming, each partial carries a *cumulative*
+    // usageMetadata snapshot for the in-progress model call (e.g. candidates 12 -> 40 -> 43), which
+    // is superseded by the final non-partial event. Counting partials would multiply the usage.
+    // Only non-partial events carry an authoritative per-call/per-turn total; summing those across
+    // calls and turns yields the correct invocation total for both SSE and BIDI live modes.
+    if (event.partial().orElse(false)) {
+      return Maybe.empty();
+    }
     event
         .usageMetadata()
         .ifPresent(
