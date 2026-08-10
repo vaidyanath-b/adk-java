@@ -126,8 +126,7 @@ public abstract class BigQueryLoggerConfig {
         .enabled(true)
         .maxContentLength(500 * 1024)
         .location("us") // Default location.
-        .datasetId("agent_analytics")
-        .tableName("events")
+        .tableName("agent_events")
         .clusteringFields(ImmutableList.of("event_type", "agent", "user_id"))
         .logMultiModalContent(true)
         .gcsBucketName("")
@@ -222,7 +221,23 @@ public abstract class BigQueryLoggerConfig {
     @CanIgnoreReturnValue
     public abstract Builder credentials(Credentials credentials);
 
-    public abstract BigQueryLoggerConfig build();
+    abstract BigQueryLoggerConfig autoBuild();
+
+    public BigQueryLoggerConfig build() {
+      BigQueryLoggerConfig config = autoBuild();
+      if (config.batchSize() <= 0) {
+        throw new IllegalArgumentException("batchSize must be positive, got " + config.batchSize());
+      }
+      if (config.queueMaxSize() <= 0) {
+        throw new IllegalArgumentException(
+            "queueMaxSize must be positive, got " + config.queueMaxSize());
+      }
+      if (config.maxContentLength() <= 0) {
+        throw new IllegalArgumentException(
+            "maxContentLength must be positive, got " + config.maxContentLength());
+      }
+      return config;
+    }
   }
 
   /** Retry configuration for BigQuery writes. */

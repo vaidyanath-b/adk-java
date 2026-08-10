@@ -24,7 +24,6 @@ import com.google.genai.Client;
 import com.google.genai.types.Blob;
 import com.google.genai.types.Content;
 import com.google.genai.types.FinishReason;
-import com.google.genai.types.FunctionCall;
 import com.google.genai.types.FunctionResponse;
 import com.google.genai.types.LiveConnectConfig;
 import com.google.genai.types.LiveSendClientContentParameters;
@@ -34,8 +33,11 @@ import com.google.genai.types.LiveServerContent;
 import com.google.genai.types.LiveServerMessage;
 import com.google.genai.types.LiveServerToolCall;
 import com.google.genai.types.Part;
+import com.google.genai.types.UsageMetadata;
 import io.reactivex.rxjava3.core.Completable;
 import io.reactivex.rxjava3.core.Flowable;
+import io.reactivex.rxjava3.core.Observable;
+import io.reactivex.rxjava3.disposables.CompositeDisposable;
 import io.reactivex.rxjava3.processors.PublishProcessor;
 import java.net.SocketException;
 import java.util.List;
@@ -65,6 +67,7 @@ public final class GeminiLlmConnection implements BaseLlmConnection {
   private final CompletableFuture<AsyncSession> sessionFuture;
   private final PublishProcessor<LlmResponse> responseProcessor = PublishProcessor.create();
   private final Flowable<LlmResponse> responseFlowable = responseProcessor.serialize();
+  private final CompositeDisposable disposables = new CompositeDisposable();
   private final AtomicBoolean closed = new AtomicBoolean(false);
 
   /**
@@ -120,8 +123,12 @@ public final class GeminiLlmConnection implements BaseLlmConnection {
 
     logger.debug("Received server message: {}", message.toJson());
 
-    Optional<LlmResponse> llmResponse = convertToServerResponse(message, modelName);
-    llmResponse.ifPresent(responseProcessor::onNext);
+    Observable<LlmResponse> llmResponse = convertToServerResponse(message, modelName);
+    if (!disposables.add(
+        llmResponse.subscribe(responseProcessor::onNext, responseProcessor::onError))) {
+      logger.warn(
+          "disposables container already disposed, the subscription will be disposed immediately");
+    }
   }
 
   /**
@@ -132,84 +139,103 @@ public final class GeminiLlmConnection implements BaseLlmConnection {
    * onto every emitted response. That keeps BIDI/usage events consistent with non-live flows for
    * token logging and analytics.
    */
-  static Optional<LlmResponse> convertToServerResponse(
+  static Observable<LlmResponse> convertToServerResponse(
       LiveServerMessage message, String modelName) {
+    return Observable.create(
+        emitter -> {
+          // AtomicBoolean is used to modify state from within lambdas, which
+          // require captured variables to be effectively final.
+          final AtomicBoolean handled = new AtomicBoolean(false);
+          message
+              .serverContent()
+              .ifPresent(
+                  serverContent -> {
+                    emitter.onNext(createServerContentResponse(serverContent, modelName));
+                    handled.set(true);
+                  });
+          message
+              .toolCall()
+              .ifPresent(
+                  toolCall -> {
+                    emitter.onNext(createToolCallResponse(toolCall, modelName));
+                    handled.set(true);
+                  });
+          message
+              .usageMetadata()
+              .ifPresent(
+                  usageMetadata -> {
+                    logger.debug("Received usage metadata: {}", usageMetadata);
+                    emitter.onNext(createUsageMetadataResponse(usageMetadata, modelName));
+                    handled.set(true);
+                  });
+          message
+              .toolCallCancellation()
+              .ifPresent(
+                  toolCallCancellation -> {
+                    logger.debug("Received tool call cancellation: {}", toolCallCancellation);
+                    // TODO: implement proper CFC and thus tool call cancellation handling.
+                    handled.set(true);
+                  });
+          message
+              .setupComplete()
+              .ifPresent(
+                  setupComplete -> {
+                    logger.debug("Received setup complete.");
+                    handled.set(true);
+                  });
+
+          if (!handled.get()) {
+            logger.warn("Received unknown or empty server message: {}", message.toJson());
+            emitter.onNext(createUnknownMessageResponse(modelName));
+          }
+          emitter.onComplete();
+        });
+  }
+
+  private static LlmResponse createServerContentResponse(
+      LiveServerContent serverContent, String modelName) {
     LlmResponse.Builder builder = LlmResponse.builder().modelVersion(modelName);
-    boolean hasRelevantData = false;
+    serverContent.modelTurn().ifPresent(builder::content);
+    return builder
+        .partial(serverContent.turnComplete().map(completed -> !completed).orElse(false))
+        .turnComplete(serverContent.turnComplete().orElse(false))
+        .interrupted(serverContent.interrupted().orElse(null))
+        .inputTranscription(serverContent.inputTranscription().orElse(null))
+        .outputTranscription(serverContent.outputTranscription().orElse(null))
+        .build();
+  }
 
-    if (message.serverContent().isPresent()) {
-      LiveServerContent serverContent = message.serverContent().get();
-      serverContent.modelTurn().ifPresent(builder::content);
-      builder
-          .partial(serverContent.turnComplete().map(completed -> !completed).orElse(false))
-          .turnComplete(serverContent.turnComplete().orElse(false))
-          .interrupted(serverContent.interrupted().orElse(null));
-      // Gemini can send audio + transcription in the SAME server event.
-      // Transcriptions travel in dedicated LlmResponse fields so they never
-      // overwrite the audio modelTurn content.
-      serverContent.outputTranscription().ifPresent(builder::outputTranscription);
-      serverContent.inputTranscription().ifPresent(builder::inputTranscription);
-      hasRelevantData = true;
-    } else if (message.toolCall().isPresent()) {
-      LiveServerToolCall toolCall = message.toolCall().get();
-      toolCall
-          .functionCalls()
-          .ifPresent(
-              calls -> {
-                for (FunctionCall call : calls) {
-                  builder.content(
-                      Content.builder()
-                          .parts(ImmutableList.of(Part.builder().functionCall(call).build()))
-                          .build());
-                }
-              });
-      builder.partial(false).turnComplete(false);
-      hasRelevantData = true;
-    } else if (message.toolCallCancellation().isPresent()) {
-      logger.debug("Received tool call cancellation: {}", message.toolCallCancellation().get());
-      builder.interrupted(true).turnComplete(true);
-      hasRelevantData = true;
-    } else if (message.setupComplete().isPresent()) {
-      logger.debug("Received setup complete.");
-      return Optional.empty();
-    } else if (message.sessionResumptionUpdate().isPresent()) {
-      logger.debug(
-          "Received session resumption update: {}", message.sessionResumptionUpdate().get());
-      return Optional.empty();
-    } else if (message.goAway().isPresent()) {
-      logger.debug("Received go away: {}", message.goAway().get());
-      return Optional.empty();
-    } else if (message.voiceActivityDetectionSignal().isPresent()) {
-      logger.debug(
-          "Received voice activity detection signal: {}",
-          message.voiceActivityDetectionSignal().get());
-      return Optional.empty();
-    } else if (message.voiceActivity().isPresent()) {
-      logger.debug("Received voice activity: {}", message.voiceActivity().get());
-      return Optional.empty();
-    } else if (message.usageMetadata().isEmpty()) {
-      logger.warn("Received unknown or empty server message: {}", message.toJson());
-      builder
-          .errorCode(new FinishReason("Unknown server message."))
-          .errorMessage("Received unknown server message.");
-      hasRelevantData = true;
-    }
+  private static LlmResponse createToolCallResponse(LiveServerToolCall toolCall, String modelName) {
+    LlmResponse.Builder builder = LlmResponse.builder().modelVersion(modelName);
+    toolCall
+        .functionCalls()
+        .ifPresent(
+            calls ->
+                builder.content(
+                    Content.builder()
+                        .role("model")
+                        .parts(
+                            calls.stream()
+                                .map(call -> Part.builder().functionCall(call).build())
+                                .collect(toImmutableList()))
+                        .build()));
+    return builder.partial(false).turnComplete(false).build();
+  }
 
-    if (message.usageMetadata().isPresent()) {
-      logger.debug("Received usage metadata: {}", message.usageMetadata().get());
-      builder.usageMetadata(
-          GeminiUtil.toGenerateContentResponseUsageMetadata(message.usageMetadata().get()));
-      if (!hasRelevantData) {
-        builder.partial(false).turnComplete(false);
-      }
-      hasRelevantData = true;
-    }
+  private static LlmResponse createUsageMetadataResponse(
+      UsageMetadata usageMetadata, String modelName) {
+    return LlmResponse.builder()
+        .modelVersion(modelName)
+        .usageMetadata(GeminiUtil.toGenerateContentResponseUsageMetadata(usageMetadata))
+        .build();
+  }
 
-    if (hasRelevantData) {
-      return Optional.of(builder.build());
-    }
-
-    return Optional.empty();
+  private static LlmResponse createUnknownMessageResponse(String modelName) {
+    return LlmResponse.builder()
+        .modelVersion(modelName)
+        .errorCode(new FinishReason("Unknown server message."))
+        .errorMessage("Received unknown server message.")
+        .build();
   }
 
   /** Handles errors that occur *during* the initial connection attempt. */
@@ -273,17 +299,9 @@ public final class GeminiLlmConnection implements BaseLlmConnection {
   public Completable sendRealtime(Blob blob) {
     return Completable.fromFuture(
         sessionFuture.thenCompose(
-            session -> {
-              LiveSendRealtimeInputParameters.Builder builder =
-                  LiveSendRealtimeInputParameters.builder();
-              String mimeType = blob.mimeType().orElse("").toLowerCase();
-              if (mimeType.startsWith("video/") || mimeType.startsWith("image/")) {
-                builder.video(blob);
-              } else {
-                builder.audio(blob);
-              }
-              return session.sendRealtimeInput(builder.build());
-            }));
+            session ->
+                session.sendRealtimeInput(
+                    LiveSendRealtimeInputParameters.builder().media(blob).build())));
   }
 
   /** Helper to send client content parameters. */
@@ -332,6 +350,8 @@ public final class GeminiLlmConnection implements BaseLlmConnection {
       } else {
         sessionFuture.cancel(false);
       }
+
+      disposables.dispose();
     }
   }
 

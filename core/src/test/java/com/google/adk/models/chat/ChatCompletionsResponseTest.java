@@ -5,7 +5,7 @@
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *      https://www.apache.org/licenses/LICENSE-2.0
+ *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -1198,6 +1198,46 @@ public final class ChatCompletionsResponseTest {
     Part finalToolPart = finalResponse.content().get().parts().get().get(0);
     // Preserved tool-level signature, not the message-level one.
     assertThat(finalToolPart.thoughtSignature()).hasValue(streamingToolSignature);
+  }
+
+  @Test
+  public void testChunkCollection_streamingToolCall_parsesValidJsonArgs() throws Exception {
+    String chunk1 =
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"do_thing\",\"arguments\":\"{\\\"key\\\":"
+            + " \\\"value\\\"}\"}}]}}]}";
+    String chunk2 = "{\"choices\":[{\"finish_reason\":\"tool_calls\"}]}";
+
+    ImmutableList<LlmResponse> all = runStream(chunk1, chunk2);
+
+    assertThat(all).hasSize(1);
+    LlmResponse finalResponse = all.get(0);
+    Part finalToolPart = finalResponse.content().get().parts().get().get(0);
+    assertThat(finalToolPart.functionCall().get().name()).hasValue("do_thing");
+    assertThat(finalToolPart.functionCall().get().args().get().get("key")).isEqualTo("value");
+  }
+
+  @Test
+  public void testChunkCollection_streamingToolCall_handlesEmptyArgs() throws Exception {
+    String chunk1 =
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"do_thing\",\"arguments\":\"\"}}]}}]}";
+    String chunk2 = "{\"choices\":[{\"finish_reason\":\"tool_calls\"}]}";
+
+    ImmutableList<LlmResponse> all = runStream(chunk1, chunk2);
+
+    assertThat(all).hasSize(1);
+    LlmResponse finalResponse = all.get(0);
+    Part finalToolPart = finalResponse.content().get().parts().get().get(0);
+    assertThat(finalToolPart.functionCall().get().name()).hasValue("do_thing");
+    assertThat(finalToolPart.functionCall().get().args()).isEmpty();
+  }
+
+  @Test
+  public void testChunkCollection_streamingToolCall_throwsOnInvalidJsonArgs() {
+    String chunk1 =
+        "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"do_thing\",\"arguments\":\"none\"}}]}}]}";
+    String chunk2 = "{\"choices\":[{\"finish_reason\":\"tool_calls\"}]}";
+
+    org.junit.Assert.assertThrows(IllegalArgumentException.class, () -> runStream(chunk1, chunk2));
   }
 
   // ----- Round-trip: Part(sig) --> request --> response --> Part(sig) bytewise equal -------

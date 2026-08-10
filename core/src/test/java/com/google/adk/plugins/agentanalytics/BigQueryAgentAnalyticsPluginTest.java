@@ -27,8 +27,11 @@ import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -51,6 +54,7 @@ import com.google.api.core.ApiFutures;
 import com.google.auth.Credentials;
 import com.google.cloud.bigquery.BigQuery;
 import com.google.cloud.bigquery.BigQueryOptions;
+import com.google.cloud.bigquery.Field.Mode;
 import com.google.cloud.bigquery.FieldList;
 import com.google.cloud.bigquery.QueryJobConfiguration;
 import com.google.cloud.bigquery.StandardSQLTypeName;
@@ -70,6 +74,7 @@ import com.google.genai.types.Candidate;
 import com.google.genai.types.Content;
 import com.google.genai.types.CustomMetadata;
 import com.google.genai.types.FunctionCall;
+import com.google.genai.types.FunctionResponse;
 import com.google.genai.types.GenerateContentResponse;
 import com.google.genai.types.GenerateContentResponseUsageMetadata;
 import com.google.genai.types.Part;
@@ -81,6 +86,7 @@ import io.opentelemetry.context.Scope;
 import io.opentelemetry.sdk.testing.junit4.OpenTelemetryRule;
 import io.reactivex.rxjava3.core.Flowable;
 import java.time.Duration;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -207,12 +213,14 @@ public class BigQueryAgentAnalyticsPluginTest {
     Content content = Content.builder().build();
 
     // Verify initial state
-    assertTrue(state.getTraceManager("invocation_id").getCurrentSpanId().isEmpty());
+    assertTrue(
+        state.getTraceManager("invocation_id").getCurrentSpanId(mockInvocationContext).isEmpty());
 
     plugin.onUserMessageCallback(mockInvocationContext, content).blockingSubscribe();
 
     // Verify that ensureInvocationSpan was called and created a span
-    assertTrue(state.getTraceManager("invocation_id").getCurrentSpanId().isPresent());
+    assertTrue(
+        state.getTraceManager("invocation_id").getCurrentSpanId(mockInvocationContext).isPresent());
   }
 
   @Test
@@ -226,12 +234,14 @@ public class BigQueryAgentAnalyticsPluginTest {
   @Test
   public void beforeRunCallback_ensuresInvocationSpan() throws Exception {
     // Verify initial state
-    assertTrue(state.getTraceManager("invocation_id").getCurrentSpanId().isEmpty());
+    assertTrue(
+        state.getTraceManager("invocation_id").getCurrentSpanId(mockInvocationContext).isEmpty());
 
     plugin.beforeRunCallback(mockInvocationContext).blockingSubscribe();
 
     // Verify that ensureInvocationSpan was called and created a span
-    assertTrue(state.getTraceManager("invocation_id").getCurrentSpanId().isPresent());
+    assertTrue(
+        state.getTraceManager("invocation_id").getCurrentSpanId(mockInvocationContext).isPresent());
   }
 
   @Test
@@ -390,6 +400,52 @@ public class BigQueryAgentAnalyticsPluginTest {
   }
 
   @Test
+  public void ensureTableExists_retriesAfterFailure() throws Exception {
+    when(mockBigQuery.getTable(any(TableId.class)))
+        .thenThrow(new RuntimeException("Table check failed"));
+    Content content = Content.builder().build();
+
+    plugin.onUserMessageCallback(mockInvocationContext, content).blockingSubscribe();
+    plugin.onUserMessageCallback(mockInvocationContext, content).blockingSubscribe();
+
+    // A failed bootstrap must leave the table un-ensured so it is retried on the next event, rather
+    // than being masked as ready. With retry, getTable is invoked once per event.
+    verify(mockBigQuery, times(2)).getTable(any(TableId.class));
+  }
+
+  @Test
+  public void afterAgentCallback_stampsInternalExecutionTreeSpanIds() throws Exception {
+    CallbackContext callbackContext = mock(CallbackContext.class);
+    when(callbackContext.invocationContext()).thenReturn(mockInvocationContext);
+
+    // Establish the invocation-level span, then push a child agent span.
+    plugin
+        .onUserMessageCallback(mockInvocationContext, Content.builder().build())
+        .blockingSubscribe();
+    plugin.beforeAgentCallback(fakeAgent, callbackContext).blockingSubscribe();
+
+    TraceManager.SpanIds current =
+        state.getTraceManager("invocation_id").getCurrentSpanAndParent(mockInvocationContext);
+    String agentSpanId = current.spanId().orElseThrow();
+    String invocationSpanId = current.parentSpanId().orElseThrow();
+
+    // Completing the agent pops the agent span and must stamp the row from the internal execution
+    // tree: span_id = the popped agent span, parent_span_id = the enclosing invocation span.
+    plugin.afterAgentCallback(fakeAgent, callbackContext).blockingSubscribe();
+
+    Map<String, Object> completedRow = null;
+    Map<String, Object> row;
+    while ((row = state.getBatchProcessor("invocation_id").queue.poll()) != null) {
+      if (Objects.equals(row.get("event_type"), "AGENT_COMPLETED")) {
+        completedRow = row;
+      }
+    }
+    assertNotNull("AGENT_COMPLETED row not found", completedRow);
+    assertEquals(agentSpanId, completedRow.get("span_id"));
+    assertEquals(invocationSpanId, completedRow.get("parent_span_id"));
+  }
+
+  @Test
   public void arrowSchema_handlesNestedFields() {
     Schema schema = BigQuerySchema.getArrowSchema();
     Field contentPartsField = schema.findField("content_parts");
@@ -517,7 +573,7 @@ public class BigQueryAgentAnalyticsPluginTest {
     Span mockSpan = Span.wrap(mockSpanContext);
 
     try (Scope scope = mockSpan.makeCurrent()) {
-      state.getTraceManager("invocation_id").attachCurrentSpan();
+      state.getTraceManager("invocation_id").attachCurrentSpan(mockInvocationContext);
 
       Content content = Content.builder().build();
       plugin.onUserMessageCallback(mockInvocationContext, content).blockingSubscribe();
@@ -545,6 +601,7 @@ public class BigQueryAgentAnalyticsPluginTest {
     Event event =
         Event.builder()
             .author("agent_author")
+            .actions(EventActions.builder().stateDelta(ImmutableMap.of("key", "new_value")).build())
             .content(Content.fromParts(Part.fromText("event content")))
             .build();
 
@@ -556,8 +613,92 @@ public class BigQueryAgentAnalyticsPluginTest {
     assertEquals("agent_name", row.get("agent"));
     ObjectNode attributes = (ObjectNode) row.get("attributes");
     assertEquals("agent_author", attributes.get("author").asText());
+    assertEquals("new_value", attributes.get("state_delta").get("key").asText());
     assertTrue(row.get("content").toString().contains("event content"));
     assertEquals(false, row.get("is_truncated"));
+  }
+
+  @Test
+  public void onEventCallback_noCurrentAgent_fallsBackToEventAuthor() throws Exception {
+    // Workflow-driven callbacks may have no current agent; the "agent" column must fall back to the
+    // event author rather than the "unknown" sentinel.
+    when(mockInvocationContext.agent()).thenReturn(null);
+    Event event =
+        Event.builder()
+            .author("agent_author")
+            .actions(EventActions.builder().stateDelta(ImmutableMap.of("key", "new_value")).build())
+            .content(Content.fromParts(Part.fromText("event content")))
+            .build();
+
+    plugin.onEventCallback(mockInvocationContext, event).blockingSubscribe();
+
+    Map<String, Object> row = state.getBatchProcessor("invocation_id").queue.poll();
+    assertNotNull("Row not found in queue", row);
+    assertEquals("STATE_DELTA", row.get("event_type"));
+    assertEquals("agent_author", row.get("agent"));
+  }
+
+  @Test
+  public void onEventCallback_emptyAuthorNoCurrentAgent_fallsBackToUnknownSentinel()
+      throws Exception {
+    // An empty author is not a usable fallback: withFallbackAgent guards on
+    // `author != null && !author.isEmpty()`, so fallbackAgentName stays unset and resolveAgentName
+    // yields the "unknown" sentinel rather than an empty agent name. Pins the `&&` against a
+    // `||`-mutation (go/mutation-testing), which would stamp "" as the agent for empty-author
+    // events.
+    when(mockInvocationContext.agent()).thenReturn(null);
+    Event event =
+        Event.builder()
+            .author("")
+            .actions(EventActions.builder().stateDelta(ImmutableMap.of("key", "new_value")).build())
+            .content(Content.fromParts(Part.fromText("event content")))
+            .build();
+
+    plugin.onEventCallback(mockInvocationContext, event).blockingSubscribe();
+
+    Map<String, Object> row = state.getBatchProcessor("invocation_id").queue.poll();
+    assertNotNull("Row not found in queue", row);
+    assertEquals("STATE_DELTA", row.get("event_type"));
+    assertEquals("unknown", row.get("agent"));
+  }
+
+  @Test
+  public void onEventCallback_nullAuthorNoCurrentAgent_fallsBackToUnknownSentinelWithoutNpe()
+      throws Exception {
+    // A null author must be short-circuited by the `author != null` half of withFallbackAgent's
+    // guard so `author.isEmpty()` is never dereferenced. Exercised via the AGENT_RESPONSE path
+    // (whose extraAttributes tolerate a null author, unlike the STATE_DELTA map). Pins the `&&`
+    // against a `||`-mutation (go/mutation-testing), which would NPE on null authors.
+    when(mockInvocationContext.agent()).thenReturn(null);
+    Event event =
+        Event.builder()
+            .id("evt-id")
+            .content(Content.fromParts(Part.fromText("agent final answer")))
+            .build();
+    assertNull("Precondition: author must be null for this test", event.author());
+
+    plugin.onEventCallback(mockInvocationContext, event).blockingSubscribe();
+    CompletableFuture.allOf(
+            state
+                .getPendingTasksForInvocation("invocation_id")
+                .toArray(new CompletableFuture<?>[0]))
+        .join();
+
+    Map<String, Object> row = state.getBatchProcessor("invocation_id").queue.poll();
+    assertNotNull("AGENT_RESPONSE row not found in queue", row);
+    assertEquals("AGENT_RESPONSE", row.get("event_type"));
+    assertEquals("unknown", row.get("agent"));
+  }
+
+  @Test
+  public void onEventCallback_emptyStateDelta_doesNotEmitStateDelta() throws Exception {
+    Event event = Event.builder().author("agent_author").build();
+
+    plugin.onEventCallback(mockInvocationContext, event).blockingSubscribe();
+
+    assertNull(
+        "No STATE_DELTA row should be emitted for an empty state delta",
+        state.getBatchProcessor("invocation_id").queue.poll());
   }
 
   @Test
@@ -580,10 +721,6 @@ public class BigQueryAgentAnalyticsPluginTest {
                 .getPendingTasksForInvocation("invocation_id")
                 .toArray(new CompletableFuture<?>[0]))
         .join();
-
-    Map<String, Object> stateDeltaRow = state.getBatchProcessor("invocation_id").queue.poll();
-    assertNotNull(stateDeltaRow);
-    assertEquals("STATE_DELTA", stateDeltaRow.get("event_type"));
 
     Map<String, Object> a2aRow = state.getBatchProcessor("invocation_id").queue.poll();
     assertNotNull("A2A_INTERACTION row not found in queue", a2aRow);
@@ -623,10 +760,6 @@ public class BigQueryAgentAnalyticsPluginTest {
                 .getPendingTasksForInvocation("invocation_id")
                 .toArray(new CompletableFuture<?>[0]))
         .join();
-
-    Map<String, Object> stateDeltaRow = state.getBatchProcessor("invocation_id").queue.poll();
-    assertNotNull(stateDeltaRow);
-    assertEquals("STATE_DELTA", stateDeltaRow.get("event_type"));
 
     Map<String, Object> agentResponseRow = state.getBatchProcessor("invocation_id").queue.poll();
     assertNotNull("AGENT_RESPONSE row not found in queue", agentResponseRow);
@@ -670,10 +803,6 @@ public class BigQueryAgentAnalyticsPluginTest {
                 .toArray(new CompletableFuture<?>[0]))
         .join();
 
-    Map<String, Object> stateDeltaRow = state.getBatchProcessor("invocation_id").queue.poll();
-    assertNotNull(stateDeltaRow);
-    assertEquals("STATE_DELTA", stateDeltaRow.get("event_type"));
-
     Map<String, Object> nextRow = state.getBatchProcessor("invocation_id").queue.poll();
     assertNull("No AGENT_RESPONSE row should be emitted", nextRow);
   }
@@ -698,10 +827,6 @@ public class BigQueryAgentAnalyticsPluginTest {
                 .toArray(new CompletableFuture<?>[0]))
         .join();
 
-    Map<String, Object> stateDeltaRow = state.getBatchProcessor("invocation_id").queue.poll();
-    assertNotNull(stateDeltaRow);
-    assertEquals("STATE_DELTA", stateDeltaRow.get("event_type"));
-
     Map<String, Object> nextRow = state.getBatchProcessor("invocation_id").queue.poll();
     assertNull("No AGENT_RESPONSE row should be emitted", nextRow);
   }
@@ -724,9 +849,6 @@ public class BigQueryAgentAnalyticsPluginTest {
                 .getPendingTasksForInvocation("invocation_id")
                 .toArray(new CompletableFuture<?>[0]))
         .join();
-
-    Map<String, Object> stateDeltaRow = state.getBatchProcessor("invocation_id").queue.poll();
-    assertNotNull(stateDeltaRow);
 
     Map<String, Object> a2aRow = state.getBatchProcessor("invocation_id").queue.poll();
     assertNotNull("A2A_INTERACTION row not found in queue", a2aRow);
@@ -781,10 +903,6 @@ public class BigQueryAgentAnalyticsPluginTest {
                 .toArray(new CompletableFuture<?>[0]))
         .join();
 
-    // Consume STATE_DELTA
-    Map<String, Object> stateDeltaRow = customState.getBatchProcessor("invocation_id").queue.poll();
-    assertNotNull(stateDeltaRow);
-
     // Get AGENT_RESPONSE
     Map<String, Object> agentResponseRow =
         customState.getBatchProcessor("invocation_id").queue.poll();
@@ -808,7 +926,7 @@ public class BigQueryAgentAnalyticsPluginTest {
     LlmRequest.Builder mockLlmRequestBuilder = mock(LlmRequest.Builder.class);
     Throwable error = new RuntimeException("model error message");
 
-    state.getTraceManager("invocation_id").pushSpan("llm_request");
+    state.getTraceManager("invocation_id").pushSpan(mockInvocationContext, "llm_request");
     plugin
         .onModelErrorCallback(mockCallbackContext, mockLlmRequestBuilder, error)
         .blockingSubscribe();
@@ -826,6 +944,26 @@ public class BigQueryAgentAnalyticsPluginTest {
     assertFalse(
         "Row should not contain is_truncated when content is null",
         row.containsKey("is_truncated"));
+  }
+
+  @Test
+  public void onModelErrorCallback_stampsPoppedSpanId() throws Exception {
+    CallbackContext mockCallbackContext = mock(CallbackContext.class);
+    when(mockCallbackContext.invocationContext()).thenReturn(mockInvocationContext);
+    LlmRequest.Builder mockLlmRequestBuilder = mock(LlmRequest.Builder.class);
+
+    String llmSpanId =
+        state.getTraceManager("invocation_id").pushSpan(mockInvocationContext, "llm_request");
+    plugin
+        .onModelErrorCallback(
+            mockCallbackContext, mockLlmRequestBuilder, new RuntimeException("boom"))
+        .blockingSubscribe();
+
+    Map<String, Object> row = state.getBatchProcessor("invocation_id").queue.poll();
+    assertNotNull("Row not found in queue", row);
+    assertEquals("LLM_ERROR", row.get("event_type"));
+    // The error row's span_id must come from the popped internal span, not the post-pop stack.
+    assertEquals(llmSpanId, row.get("span_id"));
   }
 
   @Test
@@ -859,8 +997,8 @@ public class BigQueryAgentAnalyticsPluginTest {
         tracer.spanBuilder("ambient").setParent(Context.current().with(parentSpan)).startSpan();
     // Set valid ambient span context
     try (Scope scope = ambientSpan.makeCurrent()) {
-      state.getTraceManager("invocation_id").pushSpan("parent_request");
-      state.getTraceManager("invocation_id").pushSpan("llm_request");
+      state.getTraceManager("invocation_id").pushSpan(mockInvocationContext, "parent_request");
+      state.getTraceManager("invocation_id").pushSpan(mockInvocationContext, "llm_request");
       plugin.afterModelCallback(mockCallbackContext, adkResponse).blockingSubscribe();
     } finally {
       ambientSpan.end();
@@ -899,11 +1037,22 @@ public class BigQueryAgentAnalyticsPluginTest {
     ImmutableMap<String, Object> toolArgs = ImmutableMap.of("arg1", "value1");
     ImmutableMap<String, Object> result = ImmutableMap.of("res1", "value2");
 
-    state.getTraceManager("invocation_id").pushSpan("tool_request");
+    // Mirror the production flow: beforeToolCallback pushes the tool span with the SAME
+    // operation identity (from the ToolContext) that afterToolCallback pops with.
+    state.getTraceManager("invocation_id").ensureInvocationSpan(mockInvocationContext);
+    plugin.beforeToolCallback(mockTool, toolArgs, mockToolContext).blockingSubscribe();
     plugin.afterToolCallback(mockTool, toolArgs, mockToolContext, result).blockingSubscribe();
 
-    Map<String, Object> row = state.getBatchProcessor("invocation_id").queue.poll();
-    assertNotNull("Row not found in queue", row);
+    CompletableFuture.allOf(
+            state
+                .getPendingTasksForInvocation("invocation_id")
+                .toArray(new CompletableFuture<?>[0]))
+        .join();
+    Map<String, Object> row;
+    do {
+      row = state.getBatchProcessor("invocation_id").queue.poll();
+      assertNotNull("TOOL_COMPLETED row not found in queue", row);
+    } while (!Objects.equals(row.get("event_type"), "TOOL_COMPLETED"));
     assertEquals("TOOL_COMPLETED", row.get("event_type"));
     assertEquals("agent_name", row.get("agent"));
     ObjectNode contentMap = (ObjectNode) row.get("content");
@@ -929,7 +1078,7 @@ public class BigQueryAgentAnalyticsPluginTest {
 
     AgentTool a2aTool = AgentTool.create(a2aAgent);
 
-    state.getTraceManager("invocation_id").pushSpan("tool_request");
+    state.getTraceManager("invocation_id").pushSpan(mockInvocationContext, "tool_request");
     plugin
         .afterToolCallback(a2aTool, ImmutableMap.of(), mockToolContext, ImmutableMap.of())
         .blockingSubscribe();
@@ -938,6 +1087,155 @@ public class BigQueryAgentAnalyticsPluginTest {
     assertNotNull(row);
     ObjectNode contentMap = (ObjectNode) row.get("content");
     assertEquals("A2A", contentMap.get("tool_origin").asText());
+  }
+
+  @Test
+  public void afterToolCallback_stampsPoppedToolSpanId() throws Exception {
+    ToolContext mockToolContext = mock(ToolContext.class);
+    when(mockToolContext.invocationContext()).thenReturn(mockInvocationContext);
+    BaseTool mockTool = mock(BaseTool.class);
+    when(mockTool.name()).thenReturn("test_tool");
+
+    // Establish the invocation span first (so afterTool's ensureInvocationSpan keeps the stack),
+    // then push the tool span that afterTool must pop and stamp onto the row.
+    plugin
+        .onUserMessageCallback(mockInvocationContext, Content.builder().build())
+        .blockingSubscribe();
+    String toolSpanId =
+        state.getTraceManager("invocation_id").pushSpan(mockInvocationContext, "tool");
+    // After the tool span is pushed, the enclosing span is the invocation span; afterTool must
+    // stamp
+    // it as the row's parent_span_id once the tool span is popped.
+    String invocationSpanId =
+        state
+            .getTraceManager("invocation_id")
+            .getCurrentSpanAndParent(mockInvocationContext)
+            .parentSpanId()
+            .orElseThrow();
+
+    plugin
+        .afterToolCallback(mockTool, ImmutableMap.of(), mockToolContext, ImmutableMap.of("r", "v"))
+        .blockingSubscribe();
+
+    Map<String, Object> completedRow = null;
+    Map<String, Object> row;
+    while ((row = state.getBatchProcessor("invocation_id").queue.poll()) != null) {
+      if (Objects.equals(row.get("event_type"), "TOOL_COMPLETED")) {
+        completedRow = row;
+      }
+    }
+    assertNotNull("TOOL_COMPLETED row not found", completedRow);
+    // span_id must be the popped tool span, not the enclosing invocation span left on the stack.
+    assertEquals(toolSpanId, completedRow.get("span_id"));
+    // parent_span_id must reference the enclosing invocation span from the post-pop stack top.
+    assertEquals(invocationSpanId, completedRow.get("parent_span_id"));
+  }
+
+  @Test
+  public void beforeToolCallback_concurrentTool_stampsEnclosingParentNotSibling() throws Exception {
+    // Two tools run concurrently in one branch. The second tool's TOOL_STARTING parent must be its
+    // PUSH-TIME parent (the enclosing invocation span), not the current stack top (its sibling tool
+    // A). beforeTool stamps that push-time parent via an override; dropping the override would
+    // misparent the row to the sibling.
+    ToolContext ctxA = mock(ToolContext.class);
+    when(ctxA.invocationContext()).thenReturn(mockInvocationContext);
+    when(ctxA.functionCallId()).thenReturn(Optional.of("fc-A"));
+    ToolContext ctxB = mock(ToolContext.class);
+    when(ctxB.invocationContext()).thenReturn(mockInvocationContext);
+    when(ctxB.functionCallId()).thenReturn(Optional.of("fc-B"));
+    BaseTool toolA = mock(BaseTool.class);
+    when(toolA.name()).thenReturn("tool_a");
+    BaseTool toolB = mock(BaseTool.class);
+    when(toolB.name()).thenReturn("tool_b");
+
+    plugin
+        .onUserMessageCallback(mockInvocationContext, Content.builder().build())
+        .blockingSubscribe();
+    String invocationSpanId =
+        state
+            .getTraceManager("invocation_id")
+            .getCurrentSpanId(mockInvocationContext)
+            .orElseThrow();
+
+    // Tool A starts first (its span stays on the stack), then tool B starts concurrently.
+    plugin.beforeToolCallback(toolA, ImmutableMap.of(), ctxA).blockingSubscribe();
+    plugin.beforeToolCallback(toolB, ImmutableMap.of(), ctxB).blockingSubscribe();
+
+    Map<String, Object> startingB = null;
+    Map<String, Object> row;
+    while ((row = state.getBatchProcessor("invocation_id").queue.poll()) != null) {
+      if (Objects.equals(row.get("event_type"), "TOOL_STARTING")
+          && "tool_b".equals(((ObjectNode) row.get("content")).get("tool").asText())) {
+        startingB = row;
+      }
+    }
+    assertNotNull("TOOL_STARTING row for tool_b not found", startingB);
+    // Push-time parent is the enclosing invocation span, NOT sibling tool A's span.
+    assertEquals(invocationSpanId, startingB.get("parent_span_id"));
+  }
+
+  @Test
+  public void afterToolCallback_stampsParentFromPoppedRecord() throws Exception {
+    // With a matching operation identity on both sides, afterTool pops the record beforeTool pushed
+    // and must stamp TOOL_COMPLETED's parent from that POPPED record (captured at push time). After
+    // the pop the stack top is the invocation span (whose own parent is null), so dropping the
+    // override would leave the row with no parent link.
+    ToolContext mockToolContext = mock(ToolContext.class);
+    when(mockToolContext.invocationContext()).thenReturn(mockInvocationContext);
+    when(mockToolContext.functionCallId()).thenReturn(Optional.of("fc-complete"));
+    BaseTool mockTool = mock(BaseTool.class);
+    when(mockTool.name()).thenReturn("test_tool");
+
+    plugin
+        .onUserMessageCallback(mockInvocationContext, Content.builder().build())
+        .blockingSubscribe();
+    String invocationSpanId =
+        state
+            .getTraceManager("invocation_id")
+            .getCurrentSpanId(mockInvocationContext)
+            .orElseThrow();
+
+    plugin.beforeToolCallback(mockTool, ImmutableMap.of(), mockToolContext).blockingSubscribe();
+    plugin
+        .afterToolCallback(mockTool, ImmutableMap.of(), mockToolContext, ImmutableMap.of("r", "v"))
+        .blockingSubscribe();
+
+    Map<String, Object> completedRow = drainRowsByEventType().get("TOOL_COMPLETED");
+    assertNotNull("TOOL_COMPLETED row not found", completedRow);
+    assertEquals(invocationSpanId, completedRow.get("parent_span_id"));
+  }
+
+  @Test
+  public void onToolErrorCallback_popsToolSpanAndStampsParent() throws Exception {
+    // onToolError must pop the tool span pushed by beforeTool and stamp its push-time parent (the
+    // enclosing invocation span) onto the TOOL_ERROR row.
+    ToolContext mockToolContext = mock(ToolContext.class);
+    when(mockToolContext.invocationContext()).thenReturn(mockInvocationContext);
+    when(mockToolContext.functionCallId()).thenReturn(Optional.of("fc-error"));
+    BaseTool mockTool = mock(BaseTool.class);
+    when(mockTool.name()).thenReturn("failing_tool");
+
+    plugin
+        .onUserMessageCallback(mockInvocationContext, Content.builder().build())
+        .blockingSubscribe();
+    String invocationSpanId =
+        state
+            .getTraceManager("invocation_id")
+            .getCurrentSpanId(mockInvocationContext)
+            .orElseThrow();
+
+    plugin
+        .beforeToolCallback(mockTool, ImmutableMap.of("a", "b"), mockToolContext)
+        .blockingSubscribe();
+    plugin
+        .onToolErrorCallback(
+            mockTool, ImmutableMap.of("a", "b"), mockToolContext, new RuntimeException("boom"))
+        .blockingSubscribe();
+
+    Map<String, Object> errorRow = drainRowsByEventType().get("TOOL_ERROR");
+    assertNotNull("TOOL_ERROR row not found", errorRow);
+    // A present parent proves the tool span was popped (empty pop would leave no parent to stamp).
+    assertEquals(invocationSpanId, errorRow.get("parent_span_id"));
   }
 
   @Test
@@ -1109,8 +1407,10 @@ public class BigQueryAgentAnalyticsPluginTest {
     when(mockTableBuilder.setLabels(anyMap())).thenReturn(mockTableBuilder);
     when(mockTableBuilder.build()).thenReturn(mockTable);
 
-    BigQueryUtils.maybeUpgradeSchema(mockBigQuery, mockTable);
+    boolean upgraded = BigQueryUtils.maybeUpgradeSchema(mockBigQuery, mockTable);
 
+    // A successful upgrade must report the table as ready.
+    assertTrue(upgraded);
     ArgumentCaptor<StandardTableDefinition> definitionCaptor =
         ArgumentCaptor.forClass(StandardTableDefinition.class);
     verify(mockTableBuilder).setDefinition(definitionCaptor.capture());
@@ -1161,7 +1461,7 @@ public class BigQueryAgentAnalyticsPluginTest {
     when(mockTableBuilder.setLabels(anyMap())).thenReturn(mockTableBuilder);
     when(mockTableBuilder.build()).thenReturn(mockTable);
 
-    BigQueryUtils.maybeUpgradeSchema(mockBigQuery, mockTable);
+    var unused = BigQueryUtils.maybeUpgradeSchema(mockBigQuery, mockTable);
 
     ArgumentCaptor<StandardTableDefinition> definitionCaptor =
         ArgumentCaptor.forClass(StandardTableDefinition.class);
@@ -1171,6 +1471,191 @@ public class BigQueryAgentAnalyticsPluginTest {
     assertNotNull(contentParts.getSubFields().get("storage_mode"));
 
     verify(mockBigQuery).update(any(Table.class));
+  }
+
+  @Test
+  public void maybeUpgradeSchema_warnsOnStructModeDrift() throws Exception {
+    Table mockTable = mock(Table.class);
+    when(mockTable.getTableId()).thenReturn(TableId.of("project", "dataset", "table"));
+    when(mockTable.getLabels()).thenReturn(ImmutableMap.of());
+
+    // Existing table has 'content_parts' as a NULLABLE STRUCT instead of the expected REPEATED
+    ImmutableList<com.google.cloud.bigquery.Field> initialFields =
+        BigQuerySchema.getEventsSchema().getFields().stream()
+            .map(
+                f ->
+                    f.getName().equals("content_parts")
+                        ? f.toBuilder().setMode(Mode.NULLABLE).build()
+                        : f)
+            .collect(toImmutableList());
+
+    StandardTableDefinition tableDefinition =
+        StandardTableDefinition.newBuilder()
+            .setSchema(com.google.cloud.bigquery.Schema.of(initialFields))
+            .build();
+    when(mockTable.getDefinition()).thenReturn(tableDefinition);
+
+    Logger logger = Logger.getLogger(BigQueryUtils.class.getName());
+    Handler mockLogHandler = mock(Handler.class);
+    logger.addHandler(mockLogHandler);
+    try {
+      var unused = BigQueryUtils.maybeUpgradeSchema(mockBigQuery, mockTable);
+    } finally {
+      logger.removeHandler(mockLogHandler);
+    }
+
+    ArgumentCaptor<LogRecord> captor = ArgumentCaptor.forClass(LogRecord.class);
+    verify(mockLogHandler, atLeastOnce()).publish(captor.capture());
+    assertTrue(
+        "Should have warned about STRUCT mode drift on content_parts",
+        captor.getAllValues().stream()
+            .anyMatch(
+                record ->
+                    Objects.equals(record.getLevel(), Level.WARNING)
+                        && record
+                            .getMessage()
+                            .contains("Incompatible schema drift on column 'content_parts'")));
+
+    // Mode drift alone is not auto-upgradeable, so no table update should be attempted.
+    verify(mockBigQuery, never()).update(any(Table.class));
+  }
+
+  @Test
+  public void maybeUpgradeSchema_noChanges_returnsTrueWithoutUpdateOrDriftWarning()
+      throws Exception {
+    Table mockTable = mock(Table.class);
+    when(mockTable.getTableId()).thenReturn(TableId.of("project", "dataset", "table"));
+    StandardTableDefinition tableDefinition =
+        StandardTableDefinition.newBuilder().setSchema(BigQuerySchema.getEventsSchema()).build();
+    when(mockTable.getDefinition()).thenReturn(tableDefinition);
+
+    Logger logger = Logger.getLogger(BigQueryUtils.class.getName());
+    Handler mockLogHandler = mock(Handler.class);
+    logger.addHandler(mockLogHandler);
+    boolean upgraded;
+    try {
+      upgraded = BigQueryUtils.maybeUpgradeSchema(mockBigQuery, mockTable);
+    } finally {
+      logger.removeHandler(mockLogHandler);
+    }
+
+    // When the existing schema already matches, the table is ready and no update is attempted.
+    assertTrue(upgraded);
+    verify(mockBigQuery, never()).update(any(Table.class));
+
+    // Every matching field has equal modes, so no incompatible-drift warning must be emitted.
+    ArgumentCaptor<LogRecord> captor = ArgumentCaptor.forClass(LogRecord.class);
+    verify(mockLogHandler, atLeast(0)).publish(captor.capture());
+    assertFalse(
+        "No drift warning should be logged when the schema already matches",
+        captor.getAllValues().stream()
+            .anyMatch(record -> record.getMessage().contains("Incompatible schema drift")));
+  }
+
+  @Test
+  public void maybeUpgradeSchema_treatsNullModeAsNullable_noDriftWarning() throws Exception {
+    Table mockTable = mock(Table.class);
+    when(mockTable.getTableId()).thenReturn(TableId.of("project", "dataset", "table"));
+    when(mockTable.getLabels()).thenReturn(ImmutableMap.of());
+
+    // BigQuery reports getMode() == null for NULLABLE columns. Represent the NULLABLE 'event_type'
+    // column with an unset (null) mode so its comparison against the NULLABLE desired field
+    // exercises normalizeMode's null -> NULLABLE path. Build the field WITHOUT setMode: the OSS
+    // BigQuery client stores toBuilder().setMode(null) as an empty mode string and throws on
+    // getMode(), whereas an unset mode is genuinely null. Every other field matches exactly.
+    com.google.cloud.bigquery.Field nullModeEventType =
+        com.google.cloud.bigquery.Field.newBuilder("event_type", StandardSQLTypeName.STRING)
+            .build();
+    ImmutableList<com.google.cloud.bigquery.Field> initialFields =
+        BigQuerySchema.getEventsSchema().getFields().stream()
+            .map(f -> f.getName().equals("event_type") ? nullModeEventType : f)
+            .collect(toImmutableList());
+    StandardTableDefinition tableDefinition =
+        StandardTableDefinition.newBuilder()
+            .setSchema(com.google.cloud.bigquery.Schema.of(initialFields))
+            .build();
+    when(mockTable.getDefinition()).thenReturn(tableDefinition);
+
+    Logger logger = Logger.getLogger(BigQueryUtils.class.getName());
+    Handler mockLogHandler = mock(Handler.class);
+    logger.addHandler(mockLogHandler);
+    boolean upgraded;
+    try {
+      upgraded = BigQueryUtils.maybeUpgradeSchema(mockBigQuery, mockTable);
+    } finally {
+      logger.removeHandler(mockLogHandler);
+    }
+
+    // A null (unset) mode is semantically NULLABLE, so the column already matches: the table is
+    // ready, no update is attempted, and no incompatible-drift warning must be emitted for it.
+    assertTrue(upgraded);
+    verify(mockBigQuery, never()).update(any(Table.class));
+
+    ArgumentCaptor<LogRecord> captor = ArgumentCaptor.forClass(LogRecord.class);
+    verify(mockLogHandler, atLeast(0)).publish(captor.capture());
+    assertFalse(
+        "A null mode must be normalized to NULLABLE, so no drift warning should be logged for"
+            + " 'event_type'",
+        captor.getAllValues().stream()
+            .anyMatch(
+                record ->
+                    record
+                        .getMessage()
+                        .contains("Incompatible schema drift on column 'event_type'")));
+  }
+
+  @Test
+  public void maybeUpgradeSchema_warnsOnTypeDrift() throws Exception {
+    Table mockTable = mock(Table.class);
+    when(mockTable.getTableId()).thenReturn(TableId.of("project", "dataset", "table"));
+    when(mockTable.getLabels()).thenReturn(ImmutableMap.of());
+
+    // Existing 'timestamp' column has type STRING instead of the expected TIMESTAMP (same mode), so
+    // only the type-drift branch should fire.
+    ImmutableList<com.google.cloud.bigquery.Field> initialFields =
+        BigQuerySchema.getEventsSchema().getFields().stream()
+            .map(
+                f ->
+                    f.getName().equals("timestamp")
+                        ? f.toBuilder().setType(StandardSQLTypeName.STRING).build()
+                        : f)
+            .collect(toImmutableList());
+    StandardTableDefinition tableDefinition =
+        StandardTableDefinition.newBuilder()
+            .setSchema(com.google.cloud.bigquery.Schema.of(initialFields))
+            .build();
+    when(mockTable.getDefinition()).thenReturn(tableDefinition);
+
+    Logger logger = Logger.getLogger(BigQueryUtils.class.getName());
+    Handler mockLogHandler = mock(Handler.class);
+    logger.addHandler(mockLogHandler);
+    try {
+      var unused = BigQueryUtils.maybeUpgradeSchema(mockBigQuery, mockTable);
+    } finally {
+      logger.removeHandler(mockLogHandler);
+    }
+
+    ArgumentCaptor<LogRecord> captor = ArgumentCaptor.forClass(LogRecord.class);
+    verify(mockLogHandler, atLeastOnce()).publish(captor.capture());
+    assertTrue(
+        "Should have warned about type drift on the timestamp column",
+        captor.getAllValues().stream()
+            .anyMatch(
+                record ->
+                    Objects.equals(record.getLevel(), Level.WARNING)
+                        && record
+                            .getMessage()
+                            .contains("Incompatible schema drift on column 'timestamp'")));
+  }
+
+  @Test
+  public void isSafeIdentifier_nullIsRejectedWithoutThrowing() throws Exception {
+    // A null identifier must be rejected by the explicit guard. Without it, Pattern.matcher(null)
+    // would throw an NPE instead of returning false, so the DDL-safety check must short-circuit.
+    assertFalse(BigQueryUtils.isSafeIdentifier(null));
+    // Sanity: well-formed identifiers pass and unsafe characters are rejected.
+    assertTrue(BigQueryUtils.isSafeIdentifier("project_123-abc"));
+    assertFalse(BigQueryUtils.isSafeIdentifier("bad;drop table"));
   }
 
   @Test
@@ -1446,5 +1931,301 @@ public class BigQueryAgentAnalyticsPluginTest {
     protected Flowable<Event> runLiveImpl(InvocationContext invocationContext) {
       return Flowable.empty();
     }
+  }
+
+  private Map<String, Map<String, Object>> drainRowsByEventType() {
+    CompletableFuture.allOf(
+            state
+                .getPendingTasksForInvocation("invocation_id")
+                .toArray(new CompletableFuture<?>[0]))
+        .join();
+    Map<String, Map<String, Object>> rowsByType = new HashMap<>();
+    Map<String, Object> row;
+    while ((row = state.getBatchProcessor("invocation_id").queue.poll()) != null) {
+      rowsByType.put((String) row.get("event_type"), row);
+    }
+    return rowsByType;
+  }
+
+  @Test
+  public void logEvent_redactsSensitiveKeysAtFinalAttributesBoundary() throws Exception {
+    Event event =
+        Event.builder()
+            .author("agent_author")
+            .actions(
+                EventActions.builder()
+                    .stateDelta(
+                        ImmutableMap.of(
+                            "access_token",
+                            "super-secret",
+                            "nested",
+                            ImmutableMap.of("api_key", "k-123"),
+                            "safe",
+                            "visible"))
+                    .build())
+            .build();
+
+    plugin.onEventCallback(mockInvocationContext, event).blockingSubscribe();
+
+    Map<String, Object> row = state.getBatchProcessor("invocation_id").queue.poll();
+    assertNotNull("Row not found in queue", row);
+    assertEquals("STATE_DELTA", row.get("event_type"));
+    JsonNode attributes = (JsonNode) row.get("attributes");
+    // state_delta enters attributes directly (not via the content formatter); the final
+    // output-boundary pass must still redact sensitive keys, including nested ones.
+    assertEquals("[REDACTED]", attributes.get("state_delta").get("access_token").asText());
+    assertEquals("[REDACTED]", attributes.get("state_delta").get("nested").get("api_key").asText());
+    assertEquals("visible", attributes.get("state_delta").get("safe").asText());
+  }
+
+  @Test
+  public void onEventCallback_hitlFunctionCall_emitsRequestNotCompleted() throws Exception {
+    Event event =
+        Event.builder()
+            .author("agent_author")
+            .content(
+                Content.fromParts(
+                    Part.builder()
+                        .functionCall(
+                            FunctionCall.builder()
+                                .name("adk_request_confirmation")
+                                .id("fc-1")
+                                .args(ImmutableMap.of("prompt", "approve?"))
+                                .build())
+                        .build()))
+            .build();
+
+    plugin.onEventCallback(mockInvocationContext, event).blockingSubscribe();
+    Map<String, Map<String, Object>> rows = drainRowsByEventType();
+
+    // The synthetic function CALL is the HITL request (the pause side), not a completion.
+    assertTrue(
+        "Expected HITL_CONFIRMATION_REQUEST, got: " + rows.keySet(),
+        rows.containsKey("HITL_CONFIRMATION_REQUEST"));
+    assertFalse(rows.containsKey("HITL_CONFIRMATION_REQUEST_COMPLETED"));
+  }
+
+  @Test
+  public void onEventCallback_longRunningHitlCall_emitsPairedToolPaused() throws Exception {
+    Event event =
+        Event.builder()
+            .author("agent_author")
+            .longRunningToolIds(ImmutableSet.of("fc-1"))
+            .content(
+                Content.fromParts(
+                    Part.builder()
+                        .functionCall(
+                            FunctionCall.builder()
+                                .name("adk_request_credential")
+                                .id("fc-1")
+                                .args(ImmutableMap.of("scope", "email"))
+                                .build())
+                        .build()))
+            .build();
+
+    plugin.onEventCallback(mockInvocationContext, event).blockingSubscribe();
+    Map<String, Map<String, Object>> rows = drainRowsByEventType();
+
+    assertTrue(rows.containsKey("HITL_CREDENTIAL_REQUEST"));
+    Map<String, Object> paused = rows.get("TOOL_PAUSED");
+    assertNotNull("TOOL_PAUSED row not found, got: " + rows.keySet(), paused);
+    JsonNode attributes = (JsonNode) paused.get("attributes");
+    assertEquals("hitl_credential", attributes.get("pause_kind").asText());
+    assertEquals("fc-1", attributes.get("function_call_id").asText());
+  }
+
+  @Test
+  public void onEventCallback_longRunningOrdinaryCall_emitsToolPausedWithToolKind()
+      throws Exception {
+    Event event =
+        Event.builder()
+            .author("agent_author")
+            .longRunningToolIds(ImmutableSet.of("fc-2"))
+            .content(
+                Content.fromParts(
+                    Part.builder()
+                        .functionCall(
+                            FunctionCall.builder()
+                                .name("my_long_tool")
+                                .id("fc-2")
+                                .args(ImmutableMap.of("job", "batch-7"))
+                                .build())
+                        .build()))
+            .build();
+
+    plugin.onEventCallback(mockInvocationContext, event).blockingSubscribe();
+    Map<String, Map<String, Object>> rows = drainRowsByEventType();
+
+    Map<String, Object> paused = rows.get("TOOL_PAUSED");
+    assertNotNull("TOOL_PAUSED row not found, got: " + rows.keySet(), paused);
+    JsonNode attributes = (JsonNode) paused.get("attributes");
+    assertEquals("tool", attributes.get("pause_kind").asText());
+    assertEquals("fc-2", attributes.get("function_call_id").asText());
+    // An ordinary long-running call is not a HITL request.
+    assertFalse(rows.keySet().stream().anyMatch(k -> k.startsWith("HITL_")));
+  }
+
+  @Test
+  public void onUserMessageCallback_hitlFunctionResponse_emitsCompleted() throws Exception {
+    Content userMessage =
+        Content.fromParts(
+            Part.builder()
+                .functionResponse(
+                    FunctionResponse.builder()
+                        .name("adk_request_input")
+                        .id("fc-3")
+                        .response(ImmutableMap.of("value", "user typed this"))
+                        .build())
+                .build());
+
+    plugin.onUserMessageCallback(mockInvocationContext, userMessage).blockingSubscribe();
+    Map<String, Map<String, Object>> rows = drainRowsByEventType();
+
+    assertTrue(rows.containsKey("USER_MESSAGE_RECEIVED"));
+    // The resumed HITL input arrives as a FunctionResponse and completes the HITL pair; it must
+    // not also emit TOOL_COMPLETED.
+    Map<String, Object> completed = rows.get("HITL_INPUT_REQUEST_COMPLETED");
+    assertNotNull("Expected HITL_INPUT_REQUEST_COMPLETED, got: " + rows.keySet(), completed);
+    assertFalse(rows.containsKey("TOOL_COMPLETED"));
+    // The completion carries the pause pair keys so it joins its HITL_*_REQUEST / TOOL_PAUSED
+    // rows even when multiple HITL requests share an invocation.
+    JsonNode completedAttributes = (JsonNode) completed.get("attributes");
+    assertEquals("hitl_input", completedAttributes.get("pause_kind").asText());
+    assertEquals("fc-3", completedAttributes.get("function_call_id").asText());
+  }
+
+  @Test
+  public void onUserMessageCallback_nonHitlFunctionResponse_emitsToolCompletedWithPairKeys()
+      throws Exception {
+    Content userMessage =
+        Content.fromParts(
+            Part.builder()
+                .functionResponse(
+                    FunctionResponse.builder()
+                        .name("my_long_tool")
+                        .id("fc-4")
+                        .response(ImmutableMap.of("status", "done"))
+                        .build())
+                .build());
+
+    plugin.onUserMessageCallback(mockInvocationContext, userMessage).blockingSubscribe();
+    Map<String, Map<String, Object>> rows = drainRowsByEventType();
+
+    // A non-HITL FunctionResponse in a user message is the resume side of a paused long-running
+    // tool; it emits TOOL_COMPLETED carrying the pause pair keys for the BigQuery join.
+    Map<String, Object> completed = rows.get("TOOL_COMPLETED");
+    assertNotNull("TOOL_COMPLETED row not found, got: " + rows.keySet(), completed);
+    JsonNode attributes = (JsonNode) completed.get("attributes");
+    assertEquals("tool", attributes.get("pause_kind").asText());
+    assertEquals("fc-4", attributes.get("function_call_id").asText());
+    JsonNode content = (JsonNode) completed.get("content");
+    assertEquals("my_long_tool", content.get("tool").asText());
+    assertNotNull(content.get("result"));
+  }
+
+  @Test
+  public void onEventCallback_hitlFunctionResponse_completionCarriesPairKeys() throws Exception {
+    Event event =
+        Event.builder()
+            .author("agent_author")
+            .content(
+                Content.fromParts(
+                    Part.builder()
+                        .functionResponse(
+                            FunctionResponse.builder()
+                                .name("adk_request_confirmation")
+                                .id("fc-7")
+                                .response(ImmutableMap.of("confirmed", true))
+                                .build())
+                        .build()))
+            .build();
+
+    plugin.onEventCallback(mockInvocationContext, event).blockingSubscribe();
+    Map<String, Map<String, Object>> rows = drainRowsByEventType();
+
+    Map<String, Object> completed = rows.get("HITL_CONFIRMATION_REQUEST_COMPLETED");
+    assertNotNull(
+        "HITL_CONFIRMATION_REQUEST_COMPLETED row not found, got: " + rows.keySet(), completed);
+    JsonNode attributes = (JsonNode) completed.get("attributes");
+    assertEquals("hitl_confirmation", attributes.get("pause_kind").asText());
+    assertEquals("fc-7", attributes.get("function_call_id").asText());
+    // Content key parity: both HITL completion producer paths (event and user-message) use
+    // "result", matching the Python plugin, so one event type has one queryable content shape.
+    JsonNode content = (JsonNode) completed.get("content");
+    assertNotNull("content.result must be present on the event path", content.get("result"));
+  }
+
+  @Test
+  public void concurrentIdLessTools_keepSpanOwnership() throws Exception {
+    // The framework materializes an absent function-call ID as "" — two concurrent id-less calls
+    // must not collide on it and cross-pop each other's spans.
+    BaseTool toolA = mock(BaseTool.class);
+    when(toolA.name()).thenReturn("tool_a");
+    BaseTool toolB = mock(BaseTool.class);
+    when(toolB.name()).thenReturn("tool_b");
+    ToolContext contextA = mock(ToolContext.class);
+    when(contextA.invocationContext()).thenReturn(mockInvocationContext);
+    when(contextA.functionCallId()).thenReturn(Optional.of(""));
+    ToolContext contextB = mock(ToolContext.class);
+    when(contextB.invocationContext()).thenReturn(mockInvocationContext);
+    when(contextB.functionCallId()).thenReturn(Optional.of(""));
+
+    state.getTraceManager("invocation_id").ensureInvocationSpan(mockInvocationContext);
+    plugin.beforeToolCallback(toolA, ImmutableMap.of(), contextA).blockingSubscribe();
+    plugin.beforeToolCallback(toolB, ImmutableMap.of(), contextB).blockingSubscribe();
+    // A completes FIRST even though B's record sits above it.
+    plugin
+        .afterToolCallback(toolA, ImmutableMap.of(), contextA, ImmutableMap.of())
+        .blockingSubscribe();
+    plugin
+        .afterToolCallback(toolB, ImmutableMap.of(), contextB, ImmutableMap.of())
+        .blockingSubscribe();
+
+    CompletableFuture.allOf(
+            state
+                .getPendingTasksForInvocation("invocation_id")
+                .toArray(new CompletableFuture<?>[0]))
+        .join();
+    Map<String, String> startingSpanByTool = new HashMap<>();
+    Map<String, String> completedSpanByTool = new HashMap<>();
+    Map<String, Object> row;
+    while ((row = state.getBatchProcessor("invocation_id").queue.poll()) != null) {
+      String tool = ((JsonNode) row.get("content")).get("tool").asText();
+      if (Objects.equals(row.get("event_type"), "TOOL_STARTING")) {
+        startingSpanByTool.put(tool, (String) row.get("span_id"));
+      } else if (Objects.equals(row.get("event_type"), "TOOL_COMPLETED")) {
+        completedSpanByTool.put(tool, (String) row.get("span_id"));
+      }
+    }
+
+    // Each tool's completion row references ITS OWN starting span, not the sibling's.
+    assertEquals(startingSpanByTool.get("tool_a"), completedSpanByTool.get("tool_a"));
+    assertEquals(startingSpanByTool.get("tool_b"), completedSpanByTool.get("tool_b"));
+    assertFalse(
+        "sibling id-less tools must not share a span",
+        startingSpanByTool.get("tool_a").equals(startingSpanByTool.get("tool_b")));
+  }
+
+  @Test
+  public void logEvent_sessionState_redactedBeforeTruncationFallback() throws Exception {
+    // One unserializable session-state value must not stringify the whole state map (which would
+    // put the sibling secret beyond the reach of key redaction); state is redacted BEFORE
+    // truncation, per leaf.
+    Session sessionWithState =
+        Session.builder("session_id").appName("test_app").userId("test_user").build();
+    when(mockInvocationContext.session()).thenReturn(sessionWithState);
+    sessionWithState.state().put("api_key", "super-secret");
+    sessionWithState.state().put("bad", new Object());
+    sessionWithState.state().put("ok", "visible");
+
+    plugin.beforeRunCallback(mockInvocationContext).blockingSubscribe();
+
+    Map<String, Object> row = state.getBatchProcessor("invocation_id").queue.poll();
+    assertNotNull("Row not found in queue", row);
+    JsonNode stateNode = ((JsonNode) row.get("attributes")).get("session_metadata").get("state");
+    assertTrue("session state must remain structured, not stringified", stateNode.isObject());
+    assertEquals("[REDACTED]", stateNode.get("api_key").asText());
+    assertEquals("[UNSERIALIZABLE]", stateNode.get("bad").asText());
+    assertEquals("visible", stateNode.get("ok").asText());
   }
 }

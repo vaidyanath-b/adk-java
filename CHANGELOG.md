@@ -1,5 +1,84 @@
 # Changelog
 
+## [1.7.1](https://github.com/google/adk-java/compare/v1.7.0...v1.7.1) (2026-07-28)
+
+
+### Bug Fixes
+
+* **codeexecutors:** add opt-in strict sandbox to ContainerCodeExecutor ([8049f7e](https://github.com/google/adk-java/commit/8049f7e5362ca654bf3706ea465f8d1021ee0346))
+* **core:** fallback to name when Agent description is missing ([233b83b](https://github.com/google/adk-java/commit/233b83bcacc39f7b6a1204a7644a1a5f13557a20))
+* **events:** accumulate endOfAgent in EventActions.merge to preserve parallel stop requests ([03b04fa](https://github.com/google/adk-java/commit/03b04fa2b17b8b9fc508add4d1013e83a4975cfe))
+* **mcp:** honor stdioServerParams in McpToolset.fromConfig ([cf71d7b](https://github.com/google/adk-java/commit/cf71d7bb07398d6fabd3a3ade24f31db98f9f36e))
+* preserve all parallel function calls on the live (BIDI) connection ([edc330d](https://github.com/google/adk-java/commit/edc330d760d8194058610907e717f13425717d8b))
+* **sessions:** apply afterTimestamp and numRecentEvents together in VertexAiSessionService ([24a4588](https://github.com/google/adk-java/commit/24a4588004228d6117d9ab4a45ce93be4c952d3c))
+* **sessions:** apply numRecentEvents and afterTimestamp together in InMemorySessionService ([4d19f7d](https://github.com/google/adk-java/commit/4d19f7d92becff955de12e2a58bc6bb23f14492d))
+
+## [1.7.0](https://github.com/google/adk-java/compare/v1.6.0...v1.7.0) (2026-07-17)
+
+
+### Features
+
+* BQAA Java preview-readiness fixes (redaction, table bootstrap, drop stats) ([c685ece](https://github.com/google/adk-java/commit/c685ece46bffd44adbf228e86a946e3a73d2a624))
+* **flows:** enable forced FC reordering based on gemini-3 model name ([fc95ce7](https://github.com/google/adk-java/commit/fc95ce77507fb83ecb02be17d4692d6305722f28))
+* Propagate A2A metadata to RunConfig for request-scoped access ([285547b](https://github.com/google/adk-java/commit/285547bc91c5f92975eb4ffe7e610a9ff4b4fd07))
+* share a single OkHttpClient with injectable daemon threads across the ADK ([2394a95](https://github.com/google/adk-java/commit/2394a9501a15470eba5a164dadf76fa28aeb649b))
+* Update 'gen_ai.usage.input_tokens' to include tool used tokens to match python ADK ([ba23601](https://github.com/google/adk-java/commit/ba23601c09927c4827f3a62d5df8e637e2df33d6))
+
+
+### Bug Fixes
+
+* **agents:** warn when AgentTool config_path escapes agent base directory ([7a4113e](https://github.com/google/adk-java/commit/7a4113e02d04aa17d62aaf3785b00306bb9eb815))
+* Allow -latest model aliases in GoogleSearchTool ([9181ea6](https://github.com/google/adk-java/commit/9181ea6a5e04b195b69e8577c225f7d456cb4164))
+* avoid StackOverflowError in PersistBarrier.awaitPersisted for large steps ([a38b824](https://github.com/google/adk-java/commit/a38b824dba1800e9c58ec8ba74e2b65fb205faf1))
+* **bigquery:** BQAA Java P1 preview-readiness fixes (tracing, lifecycle, redaction, HITL) ([2027a4b](https://github.com/google/adk-java/commit/2027a4b53dba2c660ee20ff0bf87dc1a1e936e43))
+* confine config-driven dynamic class loading to intended types ([3967cfa](https://github.com/google/adk-java/commit/3967cfa6297530e8274fad4ab0ec833525c2db69))
+* correctly reassemble streamed function-call arguments in Gemini streaming ([6bae658](https://github.com/google/adk-java/commit/6bae658b0592aa936e1b48e96ff9f995593ba086))
+* fix Claude MCP tool `inputSchema` by falling back to `parametersJsonSchema` ([760c8da](https://github.com/google/adk-java/commit/760c8da2119103bcad57cbbebdff10619c976eb0))
+* **mcp:** guard empty tool parameters in `adkToMcpToolType` ([66fa921](https://github.com/google/adk-java/commit/66fa921e5af2054b9274100039f4a2cefef7964a))
+* preserve non-client function call IDs in GeminiUtil ([971abb4](https://github.com/google/adk-java/commit/971abb4d8f33df58ac42ac83b3d3f8fc8efba871))
+* preserve provider ChatOptions type to prevent ClassCastException ([5c3d328](https://github.com/google/adk-java/commit/5c3d328cb07eb371cbf809e3263e08fdc5c4c8e5))
+* prevent dropping grounding-only responses in BaseLlmFlow ([4de0d8c](https://github.com/google/adk-java/commit/4de0d8c590a96d218985c4b6bad806021390b4f2))
+* propagate A2A request metadata into the run config in `AgentExecutor` ([410ff81](https://github.com/google/adk-java/commit/410ff810a7126c4ba1abdb5435b1a0c4a9c2fd95))
+
+## [1.6.0](https://github.com/google/adk-java/compare/v1.5.0...v1.6.0) (2026-07-06)
+
+
+### Features
+
+* Add ADK Issue Monitoring (Spam Detection) Agent sample for Java ([fd45dda](https://github.com/google/adk-java/commit/fd45dda7c07dfd241ff6650d41a323857bfd632e))
+* Add ADK Java Issue Triaging Agent sample ([fa94438](https://github.com/google/adk-java/commit/fa9443825bf9ecbaa6af5ee28f3fad8d162d74fa))
+* Add ADK PR Triaging Agent for google/adk-java ([f14f644](https://github.com/google/adk-java/commit/f14f6442c5a0f11d7772d8c47d92cc23013d0010))
+* Add chat-completions API support to ApigeeLlm ([df73784](https://github.com/google/adk-java/commit/df737840299cd2369a699abb4bd6028d7da1a630))
+* Add ClassPathSkillSource to load skills from the Java classpath ([587073a](https://github.com/google/adk-java/commit/587073a23ea781efd44990ad440b52caace3db4f))
+* Adds the ADK Stale Issue Auditor sample ([b6bd2dd](https://github.com/google/adk-java/commit/b6bd2dde4b1e26896815a23c686c9068b10e5397))
+* advance SequentialAgent to later sub-agents after a HITL resume when resumability is enabled ([407478b](https://github.com/google/adk-java/commit/407478bc131721c23318a3f8e8a06521490494e9))
+* **flows:** add RunConfig.groupFunctionResponsesInHistory to group function calls before responses ([1b9b395](https://github.com/google/adk-java/commit/1b9b39546728db9b776769fb5465aa54947ce488))
+* Updated Spring AI to 2.0.0, ECJ, build works with Java 25 ([3f6665b](https://github.com/google/adk-java/commit/3f6665b2734d6c3a610c069f30fa305ea137f35a))
+
+
+### Bug Fixes
+
+* **core:** allow Long values to match INTEGER schema type ([a6d41cf](https://github.com/google/adk-java/commit/a6d41cff76682bc16b9871f3f3fd5a11cb1cccf9))
+* **dev:** keep '*' CORS default, drive WebSocket origins from config, warn on '*' ([5029081](https://github.com/google/adk-java/commit/50290814c7821b08e8e542caddfab1113a5b8c45))
+* **dev:** use localhost port wildcard for default CORS/WebSocket origins ([cb73317](https://github.com/google/adk-java/commit/cb733173574cec5f54c23858ce0ecdbf9c74f2f0))
+* **flows:** end invocation on a deferred long-running tool call ([6dd4594](https://github.com/google/adk-java/commit/6dd459457c917f83c0667480b7fc443794f63da8))
+* **gemini:** align streaming function-call handling with ADK Python ([37bb5e6](https://github.com/google/adk-java/commit/37bb5e6a7b01470d9f07a7b03ac3019bb7ddcc14))
+* ignore usage-only responses outside bidi ([a6cb87a](https://github.com/google/adk-java/commit/a6cb87ae2016c6de25d2b8a7ae369c5e95a43d92))
+* Make dry_run configurable for ADK Java PR triage, spam detection, and issue triage workflows ([4225b07](https://github.com/google/adk-java/commit/4225b07ed356b5fc0a70c0620b42cbef297d722d))
+* Make stale issue workflow configurable for dry runs ([d0edd41](https://github.com/google/adk-java/commit/d0edd41bfa30388f03092d70813e1136cee3295d))
+* map ChatResponse usage metadata to LlmResponse ([71f6929](https://github.com/google/adk-java/commit/71f69293ecfe2eb92b48b3cc9d58b60c71758481))
+* map token usage metadata for Anthropic Claude model ([f76c5f9](https://github.com/google/adk-java/commit/f76c5f98ce15759723b1e21f4c0c6485a1c810fd))
+* Move @JsonCreator inside LiveRequest Builder ([d667db8](https://github.com/google/adk-java/commit/d667db8e4f18633f15e5fd375f45b036c2801048))
+* preserve non-text output in streaming responses ([b8be90d](https://github.com/google/adk-java/commit/b8be90d24ef87efdb06881e471a1396c2a281564))
+* prevent cross-user session data disclosure in VertexAiSessionService ([d1b1d92](https://github.com/google/adk-java/commit/d1b1d927f36c23cf50ef8a5abcf475c0215edd01))
+* Resolve NPE when McpTool description is null ([8ed64ea](https://github.com/google/adk-java/commit/8ed64ea2ad4cfecc71faf16d150c7c80da13ac1a))
+* Safely handle empty model in GoogleSearchTool request processor ([e255192](https://github.com/google/adk-java/commit/e255192b293980ab843616dbd459ee48d5debff7))
+* scope ADK Java docs release analyzer to a single language ([07a2ec9](https://github.com/google/adk-java/commit/07a2ec992713a4e215c93539ea1866d9469e78fd))
+* **skills:** prevent path traversal in LocalSkillSource ([55392f6](https://github.com/google/adk-java/commit/55392f64b554adf2d46ff7f9824ec4fd87434340))
+* use daemon threads in OkHttp dispatchers to allow graceful JVM shutdown ([9b046b6](https://github.com/google/adk-java/commit/9b046b6a3f72ff279fe852899d92627983baa2c2))
+* Use existing secrets and built-in token in ADK docs release analyzer workflow ([456234f](https://github.com/google/adk-java/commit/456234f264f519796609bbfc0556932b34a7f7a0))
+* widen Integer to Long in castValue() for boxed Long parameter ([bc32948](https://github.com/google/adk-java/commit/bc32948b462e8cc17c366c661f29564aade5c93e))
+
 ## [1.5.0](https://github.com/google/adk-java/compare/v1.4.0...v1.5.0) (2026-06-20)
 
 

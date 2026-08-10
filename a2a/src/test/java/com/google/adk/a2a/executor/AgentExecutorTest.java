@@ -1,3 +1,19 @@
+/*
+ * Copyright 2026 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package com.google.adk.a2a.executor;
 
 import static com.google.common.collect.ImmutableList.toImmutableList;
@@ -12,6 +28,7 @@ import static org.mockito.Mockito.when;
 
 import com.google.adk.agents.BaseAgent;
 import com.google.adk.agents.InvocationContext;
+import com.google.adk.agents.RunConfig;
 import com.google.adk.apps.App;
 import com.google.adk.artifacts.InMemoryArtifactService;
 import com.google.adk.events.Event;
@@ -24,6 +41,7 @@ import com.google.genai.types.Part;
 import io.a2a.server.agentexecution.RequestContext;
 import io.a2a.server.events.EventQueue;
 import io.a2a.spec.Message;
+import io.a2a.spec.MessageSendParams;
 import io.a2a.spec.TaskArtifactUpdateEvent;
 import io.a2a.spec.TaskState;
 import io.a2a.spec.TaskStatus;
@@ -44,6 +62,10 @@ import org.mockito.ArgumentCaptor;
 
 @RunWith(JUnit4.class)
 public final class AgentExecutorTest {
+
+  /** A throwable message shaped like the ones that leak host detail. */
+  private static final String SECRET_ERROR =
+      "Runner error: /home/victim/.config/adk/credentials.json (No such file)";
 
   private EventQueue eventQueue;
   private List<Object> enqueuedEvents;
@@ -119,7 +141,7 @@ public final class AgentExecutorTest {
   public void execute_withBeforeExecuteCallback_cancelsExecutionOnError() {
     // If callback returns error, execution should stop/fail.
     Callbacks.BeforeExecuteCallback callback =
-        ctx -> Single.error(new RuntimeException("Cancelled"));
+        ctx -> Single.error(new RuntimeException(SECRET_ERROR));
 
     AgentExecutorConfig config =
         AgentExecutorConfig.builder().beforeExecuteCallback(callback).build();
@@ -144,7 +166,10 @@ public final class AgentExecutorTest {
     assertThat(statusEvent.getStatus().state().toString()).isEqualTo("FAILED");
     assertThat(statusEvent.getStatus().message().getParts().get(0)).isInstanceOf(TextPart.class);
     TextPart textPart = (TextPart) statusEvent.getStatus().message().getParts().get(0);
-    assertThat(textPart.getText()).contains("Cancelled");
+    // The remote peer gets a correlation id for the logged throwable, not its
+    // message -- see AgentExecutor#failedMessage.
+    assertThat(textPart.getText()).startsWith("Agent execution failed. (error_id: ");
+    assertThat(textPart.getText()).doesNotContain(SECRET_ERROR);
   }
 
   @Test
@@ -271,7 +296,7 @@ public final class AgentExecutorTest {
 
   @Test
   public void execute_runnerFails_registersFailedEvent() {
-    testAgent.setEventsToEmit(Flowable.error(new RuntimeException("Runner error")));
+    testAgent.setEventsToEmit(Flowable.error(new RuntimeException(SECRET_ERROR)));
     AgentExecutor executor =
         new AgentExecutor.Builder()
             .agentExecutorConfig(AgentExecutorConfig.builder().build())
@@ -298,7 +323,48 @@ public final class AgentExecutorTest {
     assertThat(statusEvent.getStatus().state()).isEqualTo(TaskState.FAILED);
     assertThat(statusEvent.getStatus().message().getParts().get(0)).isInstanceOf(TextPart.class);
     TextPart textPart = (TextPart) statusEvent.getStatus().message().getParts().get(0);
-    assertThat(textPart.getText()).isEqualTo("Runner error");
+    // A runner failure is reported to the peer as a correlation id only: the
+    // throwable's message names host paths and is for the server log. The id is
+    // 12 hex characters, the shape adk-python emits.
+    assertThat(textPart.getText())
+        .matches("Agent execution failed\\. \\(error_id: [0-9a-f]{12}\\)");
+    assertThat(textPart.getText()).doesNotContain(SECRET_ERROR);
+    assertThat(textPart.getText()).doesNotContain("/home/victim");
+  }
+
+  @Test
+  public void failureText_withoutDebug_carriesOnlyTheCorrelationId() {
+    String text = AgentExecutor.failureText(new RuntimeException(SECRET_ERROR), "abc-123", false);
+
+    assertThat(text).isEqualTo("Agent execution failed. (error_id: abc-123)");
+  }
+
+  @Test
+  public void failureText_withDebug_carriesTheThrowableDetail() {
+    // ADK_DEBUG_ERRORS=1 is the documented opt-in for local debugging.
+    String text = AgentExecutor.failureText(new RuntimeException(SECRET_ERROR), "abc-123", true);
+
+    assertThat(text).startsWith("Agent execution failed. (error_id: abc-123): ");
+    assertThat(text).contains("java.lang.RuntimeException");
+    assertThat(text).contains(SECRET_ERROR);
+  }
+
+  @Test
+  public void debugErrorsEnabled_recognizesTheDocumentedValues() {
+    assertThat(AgentExecutor.debugErrorsEnabled("1")).isTrue();
+    assertThat(AgentExecutor.debugErrorsEnabled("true")).isTrue();
+    assertThat(AgentExecutor.debugErrorsEnabled("TRUE")).isTrue();
+    assertThat(AgentExecutor.debugErrorsEnabled("True")).isTrue();
+  }
+
+  @Test
+  public void debugErrorsEnabled_defaultsToOff() {
+    // Anything else leaves the redaction in place, including an unset variable.
+    assertThat(AgentExecutor.debugErrorsEnabled(null)).isFalse();
+    assertThat(AgentExecutor.debugErrorsEnabled("")).isFalse();
+    assertThat(AgentExecutor.debugErrorsEnabled("0")).isFalse();
+    assertThat(AgentExecutor.debugErrorsEnabled("false")).isFalse();
+    assertThat(AgentExecutor.debugErrorsEnabled("yes")).isFalse();
   }
 
   @Test
@@ -340,6 +406,62 @@ public final class AgentExecutorTest {
 
     // There should be no final status events.
     assertThat(statusEvents).isEmpty();
+  }
+
+  @Test
+  public void execute_propagatesRequestMetadataIntoRunConfig() {
+    testAgent.setEventsToEmit(Flowable.empty());
+    AgentExecutor executor =
+        new AgentExecutor.Builder()
+            .agentExecutorConfig(AgentExecutorConfig.builder().build())
+            .app(App.builder().name("test_app").rootAgent(testAgent).build())
+            .sessionService(new InMemorySessionService())
+            .artifactService(new InMemoryArtifactService())
+            .build();
+
+    Message message =
+        new Message.Builder()
+            .messageId("msg-1")
+            .role(Message.Role.USER)
+            .parts(ImmutableList.of(new TextPart("trigger")))
+            .build();
+    MessageSendParams params =
+        new MessageSendParams.Builder()
+            .message(message)
+            .metadata(ImmutableMap.of("key", "value"))
+            .build();
+    RequestContext ctx = mock(RequestContext.class);
+    when(ctx.getMessage()).thenReturn(message);
+    when(ctx.getTaskId()).thenReturn("task-1");
+    when(ctx.getContextId()).thenReturn("ctx-1");
+    when(ctx.getParams()).thenReturn(params);
+
+    executor.execute(ctx, eventQueue);
+
+    // The runner passes the enriched run config down to the agent's invocation context.
+    RunConfig runConfig = testAgent.lastInvocationContext.runConfig();
+    assertThat(runConfig.customMetadata())
+        .containsEntry("a2a_metadata", ImmutableMap.of("key", "value"));
+  }
+
+  @Test
+  public void execute_withoutRequestMetadata_leavesRunConfigCustomMetadataEmpty() {
+    testAgent.setEventsToEmit(Flowable.empty());
+    AgentExecutor executor =
+        new AgentExecutor.Builder()
+            .agentExecutorConfig(AgentExecutorConfig.builder().build())
+            .app(App.builder().name("test_app").rootAgent(testAgent).build())
+            .sessionService(new InMemorySessionService())
+            .artifactService(new InMemoryArtifactService())
+            .build();
+
+    // createRequestContext() does not stub getParams(), mirroring a request with no metadata.
+    RequestContext ctx = createRequestContext();
+
+    executor.execute(ctx, eventQueue);
+
+    RunConfig runConfig = testAgent.lastInvocationContext.runConfig();
+    assertThat(runConfig.customMetadata()).doesNotContainKey("a2a_metadata");
   }
 
   private RequestContext createRequestContext() {
@@ -507,6 +629,7 @@ public final class AgentExecutorTest {
 
   private static final class TestAgent extends BaseAgent {
     private Flowable<Event> eventsToEmit;
+    private volatile InvocationContext lastInvocationContext;
 
     TestAgent() {
       this(Flowable.empty());
@@ -524,6 +647,7 @@ public final class AgentExecutorTest {
 
     @Override
     protected Flowable<Event> runAsyncImpl(InvocationContext invocationContext) {
+      this.lastInvocationContext = invocationContext;
       return eventsToEmit;
     }
 

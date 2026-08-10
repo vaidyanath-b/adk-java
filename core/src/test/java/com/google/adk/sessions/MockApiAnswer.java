@@ -1,9 +1,26 @@
+/*
+ * Copyright 2025 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package com.google.adk.sessions;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.adk.JsonBaseModel;
 import com.google.adk.events.Event;
+import java.io.IOException;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
@@ -29,7 +46,8 @@ class MockApiAnswer implements Answer<ApiResponse> {
   private static final Pattern SESSIONS_REGEX =
       Pattern.compile("^reasoningEngines/([^/]+)/sessions$");
   private static final Pattern SESSIONS_FILTER_REGEX =
-      Pattern.compile("^reasoningEngines/([^/]+)/sessions\\?filter=user_id=([^/]+)$");
+      Pattern.compile("^reasoningEngines/([^/]+)/sessions\\?filter=(.+)$");
+  private static final String USER_ID_FILTER_PREFIX = "user_id=";
   private static final Pattern APPEND_EVENT_REGEX =
       Pattern.compile("^reasoningEngines/([^/]+)/sessions/([^/]+):appendEvent$");
   private static final Pattern EVENTS_REGEX =
@@ -135,7 +153,20 @@ class MockApiAnswer implements Answer<ApiResponse> {
     if (!sessionsMatcher.matches()) {
       return null;
     }
-    String userId = sessionsMatcher.group(2);
+    // Decode the URL-escaped filter and read the quoted user_id literal back with
+    // a JSON parser, as the real server would. An unquoted/injected filter is
+    // rejected.
+    String decodedFilter = URLDecoder.decode(sessionsMatcher.group(2), StandardCharsets.UTF_8);
+    if (!decodedFilter.startsWith(USER_ID_FILTER_PREFIX)) {
+      throw new IllegalArgumentException("Unsupported sessions filter: " + decodedFilter);
+    }
+    String userId;
+    try {
+      userId =
+          mapper.readValue(decodedFilter.substring(USER_ID_FILTER_PREFIX.length()), String.class);
+    } catch (IOException e) {
+      throw new IllegalArgumentException("Unsupported sessions filter: " + decodedFilter, e);
+    }
     List<String> userSessionsJson = new ArrayList<>();
     for (String sessionJson : sessionMap.values()) {
       Map<String, Object> session =

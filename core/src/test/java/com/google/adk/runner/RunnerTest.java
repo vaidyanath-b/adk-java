@@ -23,6 +23,7 @@ import static com.google.adk.testing.TestUtils.createTestAgentBuilder;
 import static com.google.adk.testing.TestUtils.createTestLlm;
 import static com.google.adk.testing.TestUtils.createTextLlmResponse;
 import static com.google.adk.testing.TestUtils.simplifyEvents;
+import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.truth.Truth.assertThat;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.Arrays.stream;
@@ -43,10 +44,14 @@ import com.google.adk.agents.Callbacks.AfterModelCallback;
 import com.google.adk.agents.InvocationContext;
 import com.google.adk.agents.LiveRequestQueue;
 import com.google.adk.agents.LlmAgent;
+import com.google.adk.agents.LoopAgent;
+import com.google.adk.agents.ParallelAgent;
 import com.google.adk.agents.RunConfig;
 import com.google.adk.agents.SequentialAgent;
 import com.google.adk.apps.App;
+import com.google.adk.apps.ResumabilityConfig;
 import com.google.adk.artifacts.BaseArtifactService;
+import com.google.adk.artifacts.InMemoryArtifactService;
 import com.google.adk.events.Event;
 import com.google.adk.flows.llmflows.Functions;
 import com.google.adk.models.LlmRequest;
@@ -65,14 +70,18 @@ import com.google.adk.testing.TestLlm;
 import com.google.adk.testing.TestUtils;
 import com.google.adk.testing.TestUtils.EchoTool;
 import com.google.adk.testing.TestUtils.FailingEchoTool;
+import com.google.adk.tools.BaseTool;
 import com.google.adk.tools.FunctionTool;
+import com.google.adk.tools.ToolContext;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Iterables;
 import com.google.genai.types.Content;
 import com.google.genai.types.FunctionCall;
+import com.google.genai.types.FunctionDeclaration;
 import com.google.genai.types.FunctionResponse;
 import com.google.genai.types.Part;
+import com.google.genai.types.PartialArg;
 import io.opentelemetry.api.trace.Tracer;
 import io.opentelemetry.context.Context;
 import io.opentelemetry.context.ContextKey;
@@ -87,7 +96,9 @@ import io.reactivex.rxjava3.subjects.PublishSubject;
 import io.reactivex.rxjava3.subscribers.TestSubscriber;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
@@ -95,6 +106,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import org.jspecify.annotations.Nullable;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
@@ -565,6 +577,136 @@ public final class RunnerTest {
             "test agent: FunctionResponse(name=echo_tool, response={result=from plugin})",
             "test agent: done");
     verify(plugin).onToolErrorCallback(any(), any(), any(), any());
+  }
+
+  /**
+   * Reproduces the real Vertex streaming (SSE) behavior for parallel function calls: the model
+   * emits one partial event per tool as each call streams in, then a single final aggregated event
+   * that carries all of the calls (reusing the same function-call IDs). Each tool must execute
+   * exactly once -- the partial events are surfaced to consumers but skipped for execution (see the
+   * {@code partial()} guard in {@code BaseLlmFlow}).
+   */
+  @Test
+  public void runAsync_streamingPartialParallelFunctionCalls_executesEachToolExactlyOnce() {
+    Part temperaturePart =
+        Part.builder()
+            .functionCall(
+                FunctionCall.builder()
+                    .id("adk-temperature-id")
+                    .name("getTemperature")
+                    .args(ImmutableMap.of("city", "London"))
+                    .build())
+            .build();
+    Part conditionPart =
+        Part.builder()
+            .functionCall(
+                FunctionCall.builder()
+                    .id("adk-condition-id")
+                    .name("getCondition")
+                    .args(ImmutableMap.of("city", "London"))
+                    .build())
+            .build();
+
+    // Turn 1 mirrors the real Vertex stream: a partial event for getTemperature, a partial event
+    // for getCondition, then one aggregated (non-partial) event carrying both calls. Turn 2 is the
+    // final text produced after both tools run.
+    LlmResponse partialTemperature =
+        LlmResponse.builder()
+            .content(Content.builder().role("model").parts(temperaturePart).build())
+            .partial(true)
+            .build();
+    LlmResponse partialCondition =
+        LlmResponse.builder()
+            .content(Content.builder().role("model").parts(conditionPart).build())
+            .partial(true)
+            .build();
+    LlmResponse aggregated =
+        LlmResponse.builder()
+            .content(Content.builder().role("model").parts(temperaturePart, conditionPart).build())
+            .partial(false)
+            .build();
+    TestLlm streamingTestLlm =
+        createTestLlm(
+            Flowable.just(partialTemperature, partialCondition, aggregated),
+            Flowable.just(createTextLlmResponse("done")));
+
+    CountingTool temperatureTool = new CountingTool("getTemperature");
+    CountingTool conditionTool = new CountingTool("getCondition");
+    LlmAgent agent =
+        createTestAgentBuilder(streamingTestLlm)
+            .tools(ImmutableList.of(temperatureTool, conditionTool))
+            .build();
+    Runner runner =
+        Runner.builder().app(App.builder().name("test").rootAgent(agent).build()).build();
+    Session session = runner.sessionService().createSession("test", "user").blockingGet();
+
+    List<Event> events =
+        runner
+            .runAsync(
+                "user",
+                session.id(),
+                createContent("weather in London?"),
+                RunConfig.builder().setStreamingMode(RunConfig.StreamingMode.SSE).build())
+            .toList()
+            .blockingGet();
+
+    long partialFunctionCallEvents =
+        events.stream()
+            .filter(e -> !e.functionCalls().isEmpty() && e.partial().orElse(false))
+            .count();
+    long partialFunctionCalls =
+        events.stream()
+            .filter(e -> e.partial().orElse(false))
+            .mapToLong(e -> e.functionCalls().size())
+            .sum();
+    long aggregatedFunctionCallEvents =
+        events.stream()
+            .filter(e -> !e.functionCalls().isEmpty() && !e.partial().orElse(false))
+            .count();
+    Event aggregatedEvent =
+        events.stream()
+            .filter(e -> !e.functionCalls().isEmpty() && !e.partial().orElse(false))
+            .findFirst()
+            .orElseThrow();
+    List<String> aggregatedCallIds = new ArrayList<>();
+    for (FunctionCall fc : aggregatedEvent.functionCalls()) {
+      aggregatedCallIds.add(fc.id().orElseThrow());
+    }
+    long functionResponses = events.stream().mapToLong(e -> e.functionResponses().size()).sum();
+
+    // Two partial function-call events (one per tool) are surfaced to consumers ...
+    assertThat(partialFunctionCallEvents).isEqualTo(2);
+    assertThat(partialFunctionCalls).isEqualTo(2);
+    // ... followed by exactly one final aggregated event that carries BOTH calls ...
+    assertThat(aggregatedFunctionCallEvents).isEqualTo(1);
+    assertThat(aggregatedEvent.functionCalls()).hasSize(2);
+    // ... whose function-call IDs match the ones streamed in the partial events ...
+    assertThat(aggregatedCallIds).containsExactly("adk-temperature-id", "adk-condition-id");
+    // ... but each tool is executed exactly once (partial events are skipped) ...
+    assertThat(temperatureTool.callCount.get()).isEqualTo(1);
+    assertThat(conditionTool.callCount.get()).isEqualTo(1);
+    // ... producing exactly two function responses (one per call).
+    assertThat(functionResponses).isEqualTo(2);
+  }
+
+  /** A tool that records how many times it is actually executed. */
+  private static final class CountingTool extends BaseTool {
+    final AtomicInteger callCount = new AtomicInteger(0);
+
+    CountingTool(String name) {
+      super(name, "counts invocations");
+    }
+
+    @Override
+    public Optional<FunctionDeclaration> declaration() {
+      return Optional.of(FunctionDeclaration.builder().name(name()).build());
+    }
+
+    @Override
+    public Single<Map<String, Object>> runAsync(Map<String, Object> args, ToolContext toolContext) {
+      callCount.incrementAndGet();
+      return Single.just(ImmutableMap.of("forecast", "sunny"));
+    }
   }
 
   @Test
@@ -1239,6 +1381,103 @@ public final class RunnerTest {
     assertThat(simplifyEvents(events)).containsExactly("test agent: from llm");
   }
 
+  // Runner-level regression for streamed function-call arguments: a multi-arg call whose args
+  // arrive
+  // across partial events (nameless continuation chunks, with one value split across chunks) must
+  // not crash and must execute the tool exactly once with the reassembled args.
+  @Test
+  public void runAsync_streamedFunctionCallArgs_reassembledAndToolExecuted() {
+    // Turn 1: SSE stream mimicking the post-aggregator shape - a named chunk with willContinue,
+    // then
+    // nameless continuation chunks carrying partialArgs (origin split across two), then the
+    // aggregated complete call.
+    LlmResponse namedChunk =
+        partialFcResponse(
+            FunctionCall.builder().id("fc-1").name(echoTool.name()).willContinue(true).build());
+    LlmResponse originChunk1 =
+        partialFcResponse(
+            FunctionCall.builder()
+                .partialArgs(PartialArg.builder().jsonPath("$.origin").stringValue("Krak").build())
+                .willContinue(true)
+                .build());
+    LlmResponse originChunk2 =
+        partialFcResponse(
+            FunctionCall.builder()
+                .partialArgs(PartialArg.builder().jsonPath("$.origin").stringValue("ow").build())
+                .willContinue(true)
+                .build());
+    LlmResponse destinationChunk =
+        partialFcResponse(
+            FunctionCall.builder()
+                .partialArgs(
+                    PartialArg.builder().jsonPath("$.destination").stringValue("Warsaw").build())
+                .willContinue(true)
+                .build());
+    LlmResponse aggregatedCall =
+        createFunctionCallLlmResponse(
+            "fc-1", echoTool.name(), ImmutableMap.of("origin", "Krakow", "destination", "Warsaw"));
+
+    TestLlm streamingLlm =
+        createTestLlm(
+            Flowable.just(namedChunk, originChunk1, originChunk2, destinationChunk, aggregatedCall),
+            Flowable.just(createTextLlmResponse("done")));
+    LlmAgent streamingAgent =
+        createTestAgentBuilder(streamingLlm).tools(ImmutableList.of(new EchoTool())).build();
+    Runner streamingRunner =
+        Runner.builder().app(App.builder().name("test").rootAgent(streamingAgent).build()).build();
+    Session streamingSession =
+        streamingRunner.sessionService().createSession("test", "user").blockingGet();
+
+    List<Event> events =
+        streamingRunner
+            .runAsync(
+                "user",
+                streamingSession.id(),
+                createContent("book a flight"),
+                RunConfig.builder().setStreamingMode(RunConfig.StreamingMode.SSE).build())
+            .toList()
+            .blockingGet();
+
+    int toolResponses = 0;
+    boolean sawPartialFcChunk = false;
+    boolean sawFinalText = false;
+    Map<String, Object> executedArgs = null;
+    for (Event e : events) {
+      toolResponses += e.functionResponses().size();
+      if (e.partial().orElse(false) && !e.functionCalls().isEmpty()) {
+        sawPartialFcChunk = true;
+      }
+      if (!e.partial().orElse(false) && !e.functionCalls().isEmpty()) {
+        executedArgs = e.functionCalls().get(0).args().orElse(ImmutableMap.of());
+      }
+      boolean hasDone =
+          e.content()
+              .flatMap(Content::parts)
+              .map(
+                  parts ->
+                      parts.stream()
+                          .anyMatch(p -> p.text().map(t -> t.contains("done")).orElse(false)))
+              .orElse(false);
+      sawFinalText |= hasDone;
+    }
+
+    // The streamed (incl. nameless) chunks flowed through the runner without crashing; the tool ran
+    // exactly once (only the aggregated non-partial call triggers execution) with both reassembled
+    // args; and the final text was produced.
+    assertThat(sawPartialFcChunk).isTrue();
+    assertThat(toolResponses).isEqualTo(1);
+    assertThat(executedArgs).containsExactly("origin", "Krakow", "destination", "Warsaw");
+    assertThat(sawFinalText).isTrue();
+  }
+
+  private static LlmResponse partialFcResponse(FunctionCall fc) {
+    return LlmResponse.builder()
+        .content(
+            Content.builder().role("model").parts(Part.builder().functionCall(fc).build()).build())
+        .partial(true)
+        .build();
+  }
+
   @Test
   public void runAsync_withStateDelta_mergesStateIntoSession() {
     ImmutableMap<String, Object> stateDelta = ImmutableMap.of("key1", "value1", "key2", 42);
@@ -1613,6 +1852,44 @@ public final class RunnerTest {
     testSubscriber.await();
     testSubscriber.assertComplete();
     assertThat(simplifyEvents(testSubscriber.values())).containsExactly("test agent: from llm");
+  }
+
+  @Test
+  public void runLive_asyncSessionService_persistsEvents() throws Exception {
+    BaseSessionService asyncSessionService =
+        new AppendDelayingSessionService(new InMemorySessionService(), 10);
+    Runner runnerWithAsyncSession =
+        Runner.builder()
+            .app(App.builder().name("test").rootAgent(agent).build())
+            .sessionService(asyncSessionService)
+            .build();
+    Session asyncSession =
+        runnerWithAsyncSession.sessionService().createSession("test", "user").blockingGet();
+
+    LiveRequestQueue liveRequestQueue = new LiveRequestQueue();
+    TestSubscriber<Event> testSubscriber =
+        runnerWithAsyncSession
+            .runLive(asyncSession, liveRequestQueue, RunConfig.builder().build())
+            .test();
+
+    liveRequestQueue.content(createContent("from user"));
+    liveRequestQueue.close();
+
+    testSubscriber.await();
+    testSubscriber.assertComplete();
+    assertThat(simplifyEvents(testSubscriber.values())).containsExactly("test agent: from llm");
+
+    // Verify that the events are successfully persisted to session history.
+    ImmutableList<Event> history =
+        runnerWithAsyncSession
+            .sessionService()
+            .listEvents("test", "user", asyncSession.id())
+            .blockingGet()
+            .events();
+    // The history should contain only the agent response event (user messages in liveQueue are not
+    // persisted).
+    assertThat(history).hasSize(1);
+    assertThat(history.get(0).author()).isEqualTo("test agent");
   }
 
   @Test
@@ -2048,6 +2325,560 @@ public final class RunnerTest {
         .inOrder();
   }
 
+  // OSS HITL: after an adk_request_confirmation resumes sub-agent B in a SequentialAgent(A, B, C),
+  // the workflow must advance to C without re-running the already completed A.
+  @Test
+  @SuppressWarnings("deprecation") // Resumability flag is intentionally deprecated (partial).
+  public void runAsync_withToolConfirmation_inSequentialAgent_runsLaterSubAgentsAfterResume() {
+    LlmAgent agentA =
+        createTestAgentBuilder(createTestLlm(createTextLlmResponse("agent A done")))
+            .name("a_agent")
+            .build();
+    // With resumability on, B pauses right after requesting confirmation (no extra model call), so
+    // a
+    // single follow-up response covers the resume.
+    TestLlm bTestLlm =
+        createTestLlm(
+            createFunctionCallLlmResponse(
+                "tool_call_id", "echoTool", ImmutableMap.of("message", "hello")),
+            createTextLlmResponse("Response after user confirmed."));
+    LlmAgent agentB =
+        createTestAgentBuilder(bTestLlm)
+            .name("b_agent")
+            .tools(FunctionTool.create(Tools.class, "echoTool", /* requireConfirmation= */ true))
+            .build();
+    LlmAgent agentC =
+        createTestAgentBuilder(createTestLlm(createTextLlmResponse("agent C done")))
+            .name("c_agent")
+            .build();
+    SequentialAgent workflowAgent =
+        SequentialAgent.builder()
+            .name("workflow_agent")
+            .subAgents(ImmutableList.of(agentA, agentB, agentC))
+            .build();
+    Runner runner =
+        Runner.builder()
+            .app(
+                App.builder()
+                    .name("test")
+                    .rootAgent(workflowAgent)
+                    .resumabilityConfig(ResumabilityConfig.builder().resumable(true).build())
+                    .build())
+            .build();
+    Session session = runner.sessionService().createSession("test", "user").blockingGet();
+
+    List<Event> eventsBeforeConfirmation =
+        runner
+            .runAsync("user", session.id(), Content.fromParts(Part.fromText("from user")))
+            .toList()
+            .blockingGet();
+
+    // Turn 1: A runs, B pauses for confirmation, and C must not run yet.
+    assertThat(simplifyEvents(eventsBeforeConfirmation)).contains("a_agent: agent A done");
+    assertThat(simplifyEvents(eventsBeforeConfirmation)).doesNotContain("c_agent: agent C done");
+
+    FunctionCall askUserConfirmationFunctionCall =
+        Iterables.getOnlyElement(
+            eventsBeforeConfirmation.stream()
+                .map(Functions::getAskUserConfirmationFunctionCalls)
+                .filter(functionCalls -> !functionCalls.isEmpty())
+                .findFirst()
+                .get());
+    List<Event> eventsAfterConfirmation =
+        runner
+            .runAsync(
+                "user",
+                session.id(),
+                Content.fromParts(
+                    Part.builder()
+                        .functionResponse(
+                            FunctionResponse.builder()
+                                .id(askUserConfirmationFunctionCall.id().get())
+                                .name(askUserConfirmationFunctionCall.name().get())
+                                .response(ImmutableMap.of("confirmed", true)))
+                        .build()))
+            .toList()
+            .blockingGet();
+
+    // Turn 2: B resumes and executes the tool, then C runs. A is not re-run.
+    assertThat(simplifyEvents(eventsAfterConfirmation))
+        .containsExactly(
+            "b_agent: FunctionResponse(name=echoTool, response={message=hello})",
+            "b_agent: Response after user confirmed.",
+            "c_agent: agent C done")
+        .inOrder();
+  }
+
+  // Long-running-call HITL: a pending long-running function call (not the confirmation flow) pauses
+  // SequentialAgent(A, B, C) after B; on resume B continues and C runs, without re-running A.
+  @Test
+  @SuppressWarnings("deprecation") // Resumability flag is intentionally deprecated (partial).
+  public void runAsync_withLongRunningCall_inSequentialAgent_runsLaterSubAgentsAfterResume() {
+    LlmAgent agentA =
+        createTestAgentBuilder(createTestLlm(createTextLlmResponse("agent A done")))
+            .name("a_agent")
+            .build();
+    // With resumability on, B pauses right after the long-running call (no extra model call), so a
+    // single follow-up response covers the resume.
+    TestLlm bTestLlm =
+        createTestLlm(
+            createFunctionCallLlmResponse(
+                "lro_call_id", "echoTool", ImmutableMap.of("message", "hello")),
+            createTextLlmResponse("agent B resumed"));
+    LlmAgent agentB =
+        createTestAgentBuilder(bTestLlm)
+            .name("b_agent")
+            .tools(
+                FunctionTool.create(
+                    Tools.class,
+                    "echoTool",
+                    /* requireConfirmation= */ false,
+                    /* isLongRunning= */ true))
+            .build();
+    LlmAgent agentC =
+        createTestAgentBuilder(createTestLlm(createTextLlmResponse("agent C done")))
+            .name("c_agent")
+            .build();
+    SequentialAgent workflowAgent =
+        SequentialAgent.builder()
+            .name("workflow_agent")
+            .subAgents(ImmutableList.of(agentA, agentB, agentC))
+            .build();
+    Runner runner =
+        Runner.builder()
+            .app(
+                App.builder()
+                    .name("test")
+                    .rootAgent(workflowAgent)
+                    .resumabilityConfig(ResumabilityConfig.builder().resumable(true).build())
+                    .build())
+            .build();
+    Session session = runner.sessionService().createSession("test", "user").blockingGet();
+
+    List<Event> eventsBeforeResume =
+        runner
+            .runAsync("user", session.id(), Content.fromParts(Part.fromText("from user")))
+            .toList()
+            .blockingGet();
+
+    // Turn 1: A runs, B issues the long-running call and pauses; C must not run yet. B must not
+    // make
+    // a further model call after the pending call.
+    assertThat(simplifyEvents(eventsBeforeResume)).contains("a_agent: agent A done");
+    assertThat(simplifyEvents(eventsBeforeResume)).doesNotContain("b_agent: agent B resumed");
+    assertThat(simplifyEvents(eventsBeforeResume)).doesNotContain("c_agent: agent C done");
+
+    List<Event> eventsAfterResume =
+        runner
+            .runAsync(
+                "user",
+                session.id(),
+                Content.fromParts(
+                    Part.builder()
+                        .functionResponse(
+                            FunctionResponse.builder()
+                                .id("lro_call_id")
+                                .name("echoTool")
+                                .response(ImmutableMap.of("message", "hello")))
+                        .build()))
+            .toList()
+            .blockingGet();
+
+    // Turn 2: B resumes from the long-running response, then C runs. A is not re-run.
+    assertThat(simplifyEvents(eventsAfterResume))
+        .containsExactly("b_agent: agent B resumed", "c_agent: agent C done")
+        .inOrder();
+  }
+
+  // Regression: a pending long-running call must pause the LLM flow after a single model call when
+  // resumability is on. Before the flow-level pause, the flow kept re-calling the model (re-issuing
+  // the call), burning tokens. The scripted model would re-issue the call if the flow did not
+  // pause;
+  // we assert exactly one model call was made and the later responses were never consumed.
+  @Test
+  @SuppressWarnings("deprecation") // Resumability flag is intentionally deprecated (partial).
+  public void runAsync_withLongRunningCall_resumable_pausesAfterSingleModelCall() {
+    TestLlm testLlm =
+        createTestLlm(
+            createFunctionCallLlmResponse(
+                "lro_call_id", "echoTool", ImmutableMap.of("message", "hello")),
+            // Extra responses the flow must NOT consume; reaching them means it looped.
+            createFunctionCallLlmResponse(
+                "lro_call_id", "echoTool", ImmutableMap.of("message", "hello")),
+            createTextLlmResponse("should not be reached"));
+    LlmAgent agent =
+        createTestAgentBuilder(testLlm)
+            .name("agent")
+            .tools(
+                FunctionTool.create(
+                    Tools.class,
+                    "echoTool",
+                    /* requireConfirmation= */ false,
+                    /* isLongRunning= */ true))
+            .build();
+    Runner runner =
+        Runner.builder()
+            .app(
+                App.builder()
+                    .name("test")
+                    .rootAgent(agent)
+                    .resumabilityConfig(ResumabilityConfig.builder().resumable(true).build())
+                    .build())
+            .build();
+    Session session = runner.sessionService().createSession("test", "user").blockingGet();
+
+    List<Event> events =
+        runner
+            .runAsync("user", session.id(), Content.fromParts(Part.fromText("from user")))
+            .toList()
+            .blockingGet();
+
+    // The flow paused after the single long-running call instead of re-calling the model.
+    assertThat(testLlm.getRequests()).hasSize(1);
+    assertThat(simplifyEvents(events)).doesNotContain("agent: should not be reached");
+  }
+
+  // Gating: with resumability OFF (default) the flow does NOT pause on a long-running call; it
+  // keeps
+  // calling the model as before. Pairs with the resumable test above.
+  @Test
+  public void runAsync_withLongRunningCall_resumabilityDisabled_doesNotPause() {
+    TestLlm testLlm =
+        createTestLlm(
+            createFunctionCallLlmResponse(
+                "lro_call_id", "echoTool", ImmutableMap.of("message", "hello")),
+            createTextLlmResponse("after pending call"));
+    LlmAgent agent =
+        createTestAgentBuilder(testLlm)
+            .name("agent")
+            .tools(
+                FunctionTool.create(
+                    Tools.class,
+                    "echoTool",
+                    /* requireConfirmation= */ false,
+                    /* isLongRunning= */ true))
+            .build();
+    Runner runner =
+        Runner.builder().app(App.builder().name("test").rootAgent(agent).build()).build();
+    Session session = runner.sessionService().createSession("test", "user").blockingGet();
+
+    List<Event> events =
+        runner
+            .runAsync("user", session.id(), Content.fromParts(Part.fromText("from user")))
+            .toList()
+            .blockingGet();
+
+    // No pause: the flow made a second model call and surfaced its response.
+    assertThat(testLlm.getRequests()).hasSize(2);
+    assertThat(simplifyEvents(events)).contains("agent: after pending call");
+  }
+
+  // A long-running tool awaiting an external result (real HITL, e.g. human input) returns nothing
+  // yet. The invocation must end after the single model call rather than re-invoking the model with
+  // a placeholder response and looping until the call limit. Matches Python ADK v1: the function
+  // response is skipped and the long-running call event is treated as final.
+  @Test
+  public void runAsync_withLongRunningCall_noImmediateResult_endsAfterSingleModelCall() {
+    TestLlm testLlm =
+        createTestLlm(
+            createFunctionCallLlmResponse(
+                "lro_call_id", "pendingTool", ImmutableMap.of("message", "hello")),
+            // Extra response the flow must NOT consume; reaching it means it looped.
+            createTextLlmResponse("should not be reached"));
+    LlmAgent agent =
+        createTestAgentBuilder(testLlm)
+            .name("agent")
+            .tools(
+                FunctionTool.create(
+                    Tools.class,
+                    "pendingTool",
+                    /* requireConfirmation= */ false,
+                    /* isLongRunning= */ true))
+            .build();
+    Runner runner =
+        Runner.builder().app(App.builder().name("test").rootAgent(agent).build()).build();
+    Session session = runner.sessionService().createSession("test", "user").blockingGet();
+
+    List<Event> events =
+        runner
+            .runAsync("user", session.id(), Content.fromParts(Part.fromText("from user")))
+            .toList()
+            .blockingGet();
+
+    // Ended after the single long-running call: no function response, no second model call.
+    assertThat(testLlm.getRequests()).hasSize(1);
+    assertThat(simplifyEvents(events)).doesNotContain("agent: should not be reached");
+  }
+
+  // The long-running call event is now a final response, but it carries no text. An agent with an
+  // outputKey must not overwrite that key with an empty string. Matches ADK Python's output_key
+  // guard, which skips final events that have no text part.
+  @Test
+  public void runAsync_withLongRunningCall_andOutputKey_doesNotWriteEmptyOutput() {
+    TestLlm testLlm =
+        createTestLlm(
+            createFunctionCallLlmResponse(
+                "lro_call_id", "pendingTool", ImmutableMap.of("message", "hello")));
+    LlmAgent agent =
+        createTestAgentBuilder(testLlm)
+            .name("agent")
+            .outputKey("result")
+            .tools(
+                FunctionTool.create(
+                    Tools.class,
+                    "pendingTool",
+                    /* requireConfirmation= */ false,
+                    /* isLongRunning= */ true))
+            .build();
+    Runner runner =
+        Runner.builder().app(App.builder().name("test").rootAgent(agent).build()).build();
+    Session session = runner.sessionService().createSession("test", "user").blockingGet();
+
+    List<Event> events =
+        runner
+            .runAsync("user", session.id(), Content.fromParts(Part.fromText("from user")))
+            .toList()
+            .blockingGet();
+
+    assertThat(events).hasSize(1);
+    assertThat(events.get(0).actions().stateDelta()).doesNotContainKey("result");
+  }
+
+  // Mirrors ADK Python's test_functions_long_running.test_async_function: a long-running tool that
+  // reports a non-empty "pending" status drives a multi-turn lifecycle. The initial pending result
+  // is summarized, then the caller injects progress/result function responses over later turns,
+  // each summarized by the model, and the tool executes exactly once across the whole lifecycle.
+  @Test
+  public void runAsync_longRunningCall_multiTurnLifecycle_executesToolOnce() {
+    Tools.pendingProgressToolCalls.set(0);
+    TestLlm testLlm =
+        createTestLlm(
+            createFunctionCallLlmResponse(
+                "lro_call_id", "pendingProgressTool", ImmutableMap.of("message", "hi")),
+            createTextLlmResponse("response1"),
+            createTextLlmResponse("response2"),
+            createTextLlmResponse("response3"),
+            createTextLlmResponse("response4"));
+    LlmAgent agent =
+        createTestAgentBuilder(testLlm)
+            .name("agent")
+            .tools(
+                FunctionTool.create(
+                    Tools.class,
+                    "pendingProgressTool",
+                    /* requireConfirmation= */ false,
+                    /* isLongRunning= */ true))
+            .build();
+    Runner runner =
+        Runner.builder().app(App.builder().name("test").rootAgent(agent).build()).build();
+    Session session = runner.sessionService().createSession("test", "user").blockingGet();
+
+    // Turn 1: the model calls the long-running tool; the pending result is summarized.
+    List<Event> turn1 =
+        runner
+            .runAsync("user", session.id(), Content.fromParts(Part.fromText("test1")))
+            .toList()
+            .blockingGet();
+    assertThat(testLlm.getRequests()).hasSize(2);
+    assertThat(turn1.get(0).longRunningToolIds().get())
+        .contains(turn1.get(0).functionCalls().get(0).id().get());
+    assertThat(simplifyEvents(turn1))
+        .containsExactly(
+            "agent: FunctionCall(name=pendingProgressTool, args={message=hi})",
+            "agent: FunctionResponse(name=pendingProgressTool, response={status=pending})",
+            "agent: response1")
+        .inOrder();
+    assertThat(Tools.pendingProgressToolCalls.get()).isEqualTo(1);
+
+    // Turn 2: the caller injects a progress update; the model summarizes, tool not re-run.
+    assertThat(simplifyEvents(resumeWithStatus(runner, session, "still waiting")))
+        .containsExactly("agent: response2");
+    assertThat(testLlm.getRequests()).hasSize(3);
+
+    // Turn 3: the caller injects the result.
+    assertThat(simplifyEvents(resumeWithStatus(runner, session, "done")))
+        .containsExactly("agent: response3");
+    assertThat(testLlm.getRequests()).hasSize(4);
+
+    // Turn 4: a further result is still accepted and summarized.
+    assertThat(simplifyEvents(resumeWithStatus(runner, session, "done again")))
+        .containsExactly("agent: response4");
+    assertThat(testLlm.getRequests()).hasSize(5);
+
+    // The tool executed exactly once across the whole lifecycle.
+    assertThat(Tools.pendingProgressToolCalls.get()).isEqualTo(1);
+  }
+
+  private static List<Event> resumeWithStatus(Runner runner, Session session, String status) {
+    return runner
+        .runAsync(
+            "user",
+            session.id(),
+            Content.fromParts(
+                Part.builder()
+                    .functionResponse(
+                        FunctionResponse.builder()
+                            .id("lro_call_id")
+                            .name("pendingProgressTool")
+                            .response(ImmutableMap.of("status", status)))
+                    .build()))
+        .toList()
+        .blockingGet();
+  }
+
+  // A pending long-running call must stop a resumable LoopAgent after the current iteration rather
+  // than looping again (re-calling the model every iteration), matching Python ADK v1.
+  @Test
+  @SuppressWarnings("deprecation") // Resumability flag is intentionally deprecated (partial).
+  public void runAsync_loopAgentWithLongRunningSubAgent_resumable_stopsAfterFirstIteration() {
+    AtomicInteger calls = new AtomicInteger();
+    TestLlm loopLlm =
+        createTestLlm(
+            () ->
+                calls.incrementAndGet() <= 5
+                    ? Flowable.just(
+                        createFunctionCallLlmResponse(
+                            "lro_call_id", "echoTool", ImmutableMap.of("message", "hello")))
+                    : Flowable.just(createTextLlmResponse("stop")));
+    LlmAgent inner =
+        createTestAgentBuilder(loopLlm)
+            .name("inner")
+            .tools(
+                FunctionTool.create(
+                    Tools.class,
+                    "echoTool",
+                    /* requireConfirmation= */ false,
+                    /* isLongRunning= */ true))
+            .build();
+    LoopAgent loop =
+        LoopAgent.builder()
+            .name("loop")
+            .subAgents(ImmutableList.of(inner))
+            .maxIterations(3)
+            .build();
+    Runner runner =
+        Runner.builder()
+            .app(
+                App.builder()
+                    .name("test")
+                    .rootAgent(loop)
+                    .resumabilityConfig(ResumabilityConfig.builder().resumable(true).build())
+                    .build())
+            .build();
+    Session session = runner.sessionService().createSession("test", "user").blockingGet();
+
+    List<Event> unused =
+        runner
+            .runAsync("user", session.id(), Content.fromParts(Part.fromText("from user")))
+            .toList()
+            .blockingGet();
+
+    // Paused after the first iteration: one model call, not maxIterations.
+    assertThat(loopLlm.getRequests()).hasSize(1);
+  }
+
+  // In a resumable ParallelAgent, a pending long-running call pauses only its own branch (via the
+  // flow); other branches still complete. ParallelAgent needs no special handling, matching Python
+  // ADK v1 (cancelling siblings would diverge).
+  @Test
+  @SuppressWarnings("deprecation") // Resumability flag is intentionally deprecated (partial).
+  public void runAsync_parallelAgentWithLongRunningBranch_resumable_otherBranchCompletes() {
+    TestLlm longRunningLlm =
+        createTestLlm(
+            createFunctionCallLlmResponse(
+                "lro_call_id", "echoTool", ImmutableMap.of("message", "hello")),
+            createTextLlmResponse("unexpected"));
+    LlmAgent longRunningBranch =
+        createTestAgentBuilder(longRunningLlm)
+            .name("long_running_branch")
+            .tools(
+                FunctionTool.create(
+                    Tools.class,
+                    "echoTool",
+                    /* requireConfirmation= */ false,
+                    /* isLongRunning= */ true))
+            .build();
+    LlmAgent plainBranch =
+        createTestAgentBuilder(createTestLlm(createTextLlmResponse("plain branch done")))
+            .name("plain_branch")
+            .build();
+    ParallelAgent parallel =
+        ParallelAgent.builder()
+            .name("parallel")
+            .subAgents(ImmutableList.of(longRunningBranch, plainBranch))
+            .build();
+    Runner runner =
+        Runner.builder()
+            .app(
+                App.builder()
+                    .name("test")
+                    .rootAgent(parallel)
+                    .resumabilityConfig(ResumabilityConfig.builder().resumable(true).build())
+                    .build())
+            .build();
+    Session session = runner.sessionService().createSession("test", "user").blockingGet();
+
+    List<Event> events =
+        runner
+            .runAsync("user", session.id(), Content.fromParts(Part.fromText("from user")))
+            .toList()
+            .blockingGet();
+
+    // The long-running branch paused after one model call; the other branch still completed.
+    assertThat(longRunningLlm.getRequests()).hasSize(1);
+    assertThat(simplifyEvents(events)).contains("plain_branch: plain branch done");
+  }
+
+  // Resumability disabled (default): a SequentialAgent(A, B, C) does not pause on B's HITL call, so
+  // all sub-agents run in the same turn — matching Python ADK v1 with resumability disabled.
+  @Test
+  public void
+      runAsync_withToolConfirmation_inSequentialAgent_resumabilityDisabled_runsAllSubAgents() {
+    LlmAgent agentA =
+        createTestAgentBuilder(createTestLlm(createTextLlmResponse("agent A done")))
+            .name("a_agent")
+            .build();
+    TestLlm bTestLlm =
+        createTestLlm(
+            createFunctionCallLlmResponse(
+                "tool_call_id", "echoTool", ImmutableMap.of("message", "hello")),
+            createTextLlmResponse("Response after observing tool needs confirmation."));
+    LlmAgent agentB =
+        createTestAgentBuilder(bTestLlm)
+            .name("b_agent")
+            .tools(FunctionTool.create(Tools.class, "echoTool", /* requireConfirmation= */ true))
+            .build();
+    LlmAgent agentC =
+        createTestAgentBuilder(createTestLlm(createTextLlmResponse("agent C done")))
+            .name("c_agent")
+            .build();
+    SequentialAgent workflowAgent =
+        SequentialAgent.builder()
+            .name("workflow_agent")
+            .subAgents(ImmutableList.of(agentA, agentB, agentC))
+            .build();
+    Runner runner =
+        Runner.builder().app(App.builder().name("test").rootAgent(workflowAgent).build()).build();
+    Session session = runner.sessionService().createSession("test", "user").blockingGet();
+
+    List<Event> events =
+        runner
+            .runAsync("user", session.id(), Content.fromParts(Part.fromText("from user")))
+            .toList()
+            .blockingGet();
+
+    assertThat(simplifyEvents(events)).contains("a_agent: agent A done");
+    assertThat(simplifyEvents(events)).contains("c_agent: agent C done");
+  }
+
+  // ResumabilityConfig is off by default and reflects the configured value.
+  @Test
+  @SuppressWarnings("deprecation") // ResumabilityConfig is intentionally deprecated (partial).
+  public void resumabilityConfig_defaultsToNotResumable() {
+    assertThat(ResumabilityConfig.builder().build().isResumable()).isFalse();
+    assertThat(ResumabilityConfig.builder().resumable(true).build().isResumable()).isTrue();
+  }
+
   // Orphan function responses (id not matching any prior call) should fall back to the root agent.
   @Test
   public void runAsync_withFunctionResponseNotMatchingAnyCall_fallsBackToRootAgent() {
@@ -2158,6 +2989,23 @@ public final class RunnerTest {
     public static ImmutableMap<String, Object> echoTool(String message) {
       return ImmutableMap.of("message", message);
     }
+
+    // A long-running tool awaiting an external result has nothing to return yet; FunctionTool
+    // coerces the absent return into an empty response.
+    @SuppressWarnings("unused") // Invoked reflectively by FunctionTool.
+    public static @Nullable ImmutableMap<String, Object> pendingTool(String message) {
+      return null;
+    }
+
+    static final AtomicInteger pendingProgressToolCalls = new AtomicInteger(0);
+
+    // A long-running tool that reports progress: it returns a non-empty "pending" status on the
+    // initial call. Counts executions so a test can assert it runs exactly once across turns.
+    @SuppressWarnings("unused") // Invoked reflectively by FunctionTool.
+    public static ImmutableMap<String, Object> pendingProgressTool(String message) {
+      pendingProgressToolCalls.incrementAndGet();
+      return ImmutableMap.of("status", "pending");
+    }
   }
 
   @Test
@@ -2194,5 +3042,352 @@ public final class RunnerTest {
     assertThat(artifactsSavedCounter.get()).isEqualTo(2);
     // agent was run
     assertThat(simplifyEvents(events.values())).containsExactly("test agent: from llm");
+  }
+
+  private static final String BLOB_MIME_TYPE = "example/octet-stream";
+  private static final String BLOB_PAYLOAD = "blob payload";
+  private static final String PLACEHOLDER_FORMAT =
+      "Uploaded file: %s. It has been saved to the artifacts";
+
+  private static Part blobPart() {
+    return Part.fromBytes(BLOB_PAYLOAD.getBytes(UTF_8), BLOB_MIME_TYPE);
+  }
+
+  /** The text the runner substitutes for the blob it offloaded to {@code fileName}. */
+  private static String placeholderFor(String fileName) {
+    return PLACEHOLDER_FORMAT.formatted(fileName);
+  }
+
+  /**
+   * A message whose parts list is immutable: {@code Content.Builder.parts(List)} stores the
+   * caller's list without copying it.
+   */
+  private static Content immutablePartsMessage() {
+    return Content.builder()
+        .role("user")
+        .parts(ImmutableList.of(Part.fromText("hello"), blobPart()))
+        .build();
+  }
+
+  /** A message whose parts list genai itself collected into an {@code ImmutableList}. */
+  private static Content partBuilderPartsMessage() {
+    return Content.builder()
+        .role("user")
+        .parts(Part.fromText("hello").toBuilder(), blobPart().toBuilder())
+        .build();
+  }
+
+  /**
+   * A message whose parts list accepts {@code set}. Used where the assertion is that the runner
+   * leaves the caller's message alone: with an immutable list the runner could not have modified it
+   * either way, so only a mutable one distinguishes copying from rewriting in place.
+   */
+  private static Content mutablePartsMessage() {
+    return Content.builder()
+        .role("user")
+        .parts(new ArrayList<>(ImmutableList.of(Part.fromText("hello"), blobPart())))
+        .build();
+  }
+
+  /**
+   * A message carrying two blobs, at part indices 1 and 2. The runner names each artifact after the
+   * index of the part it came from, so only a message with more than one blob distinguishes that
+   * from a running counter.
+   */
+  private static Content twoBlobsMessage() {
+    return Content.builder()
+        .role("user")
+        .parts(ImmutableList.of(Part.fromText("hello"), blobPart(), blobPart()))
+        .build();
+  }
+
+  private static RunConfig saveInputBlobs(boolean enabled) {
+    return RunConfig.builder().saveInputBlobsAsArtifacts(enabled).build();
+  }
+
+  /**
+   * Points {@link #runner} at a runner backed by a fresh {@link InMemoryArtifactService}, with a
+   * fresh {@link #session} on it. What the service stored is read back with {@link #artifactNames}
+   * and {@link Runner#artifactService()}.
+   */
+  private void useRunnerWithArtifactService() {
+    this.runner =
+        Runner.builder()
+            .app(App.builder().name("test").rootAgent(agent).build())
+            .artifactService(new InMemoryArtifactService())
+            .build();
+    this.session = this.runner.sessionService().createSession("test", "user").blockingGet();
+  }
+
+  /** The names of the artifacts saved for {@link #session}. */
+  private ImmutableList<String> artifactNames() {
+    return ImmutableList.copyOf(
+        runner
+            .artifactService()
+            .listArtifactKeys("test", "user", session.id())
+            .blockingGet()
+            .filenames());
+  }
+
+  /** The name of the single saved artifact whose file name ends in {@code suffix}. */
+  private String artifactNameEndingIn(String suffix) {
+    ImmutableList<String> matches =
+        artifactNames().stream().filter(name -> name.endsWith(suffix)).collect(toImmutableList());
+    assertThat(matches).hasSize(1);
+    return matches.get(0);
+  }
+
+  /** The user message that was actually appended to the session. */
+  private Content appendedUserMessage() {
+    Session stored =
+        runner
+            .sessionService()
+            .getSession("test", "user", session.id(), Optional.empty())
+            .blockingGet();
+    return stored.events().stream()
+        .filter(event -> event.author().equals("user"))
+        .findFirst()
+        .flatMap(Event::content)
+        .orElseThrow(() -> new AssertionError("No user message was appended to the session."));
+  }
+
+  /** The parts of the user message that was actually appended to the session. */
+  private List<Part> appendedUserParts() {
+    return appendedUserMessage()
+        .parts()
+        .orElseThrow(() -> new AssertionError("The appended user message has no parts."));
+  }
+
+  /** Asserts the run reached the model and emitted the agent's reply. */
+  private static void assertAgentReplied(TestSubscriber<Event> events) {
+    events.assertComplete();
+    assertThat(simplifyEvents(events.values())).containsExactly("test agent: from llm");
+  }
+
+  @Test
+  public void saveInputBlobsAsArtifacts_immutablePartsList_savesArtifactAndCompletes() {
+    useRunnerWithArtifactService();
+
+    var events =
+        runner.runAsync("user", session.id(), immutablePartsMessage(), saveInputBlobs(true)).test();
+
+    assertAgentReplied(events);
+    assertThat(artifactNames()).hasSize(1);
+  }
+
+  @Test
+  public void saveInputBlobsAsArtifacts_partBuilderPartsList_savesArtifactAndCompletes() {
+    useRunnerWithArtifactService();
+
+    var events =
+        runner
+            .runAsync("user", session.id(), partBuilderPartsMessage(), saveInputBlobs(true))
+            .test();
+
+    assertAgentReplied(events);
+    assertThat(artifactNames()).hasSize(1);
+  }
+
+  @Test
+  public void saveInputBlobsAsArtifacts_doesNotModifyCallerMessage() {
+    useRunnerWithArtifactService();
+    Content callerMessage = mutablePartsMessage();
+
+    var events = runner.runAsync("user", session.id(), callerMessage, saveInputBlobs(true)).test();
+
+    assertAgentReplied(events);
+    assertThat(artifactNames()).hasSize(1);
+    assertThat(callerMessage.parts().get().get(1).inlineData()).isPresent();
+    assertThat(callerMessage.parts().get().get(1).text()).isEmpty();
+  }
+
+  @Test
+  public void saveInputBlobsAsArtifacts_appendedEventReplacesBlobWithPlaceholder() {
+    useRunnerWithArtifactService();
+
+    var events =
+        runner.runAsync("user", session.id(), immutablePartsMessage(), saveInputBlobs(true)).test();
+
+    assertAgentReplied(events);
+    // The appended message is a copy of the caller's, so the role has to survive the copy.
+    assertThat(appendedUserMessage().role()).hasValue("user");
+    List<Part> appended = appendedUserParts();
+    assertThat(appended).hasSize(2);
+    assertThat(appended.get(0).text()).hasValue("hello");
+    assertThat(appended.get(1).inlineData()).isEmpty();
+    assertThat(appended.get(1).text()).hasValue(placeholderFor(artifactNames().get(0)));
+  }
+
+  @Test
+  public void saveInputBlobsAsArtifacts_twoBlobs_namesEachArtifactAfterItsPartIndex() {
+    useRunnerWithArtifactService();
+
+    var events =
+        runner.runAsync("user", session.id(), twoBlobsMessage(), saveInputBlobs(true)).test();
+
+    assertAgentReplied(events);
+    assertThat(artifactNames()).hasSize(2);
+    List<Part> appended = appendedUserParts();
+    assertThat(appended).hasSize(3);
+    assertThat(appended.get(1).text()).hasValue(placeholderFor(artifactNameEndingIn("_1")));
+    assertThat(appended.get(2).text()).hasValue(placeholderFor(artifactNameEndingIn("_2")));
+  }
+
+  @Test
+  public void saveInputBlobsAsArtifacts_storesBlobVerbatim() {
+    useRunnerWithArtifactService();
+
+    var events =
+        runner.runAsync("user", session.id(), immutablePartsMessage(), saveInputBlobs(true)).test();
+
+    assertAgentReplied(events);
+    assertThat(artifactNames()).hasSize(1);
+    Part stored =
+        runner
+            .artifactService()
+            .loadArtifact("test", "user", session.id(), artifactNames().get(0))
+            .blockingGet();
+    assertThat(new String(stored.inlineData().get().data().get(), UTF_8)).isEqualTo(BLOB_PAYLOAD);
+    assertThat(stored.inlineData().get().mimeType()).hasValue(BLOB_MIME_TYPE);
+  }
+
+  @Test
+  public void saveInputBlobsAsArtifacts_textOnlyMessage_passesThroughUnchanged() {
+    useRunnerWithArtifactService();
+    Content callerMessage = Content.fromParts(Part.fromText("hello"));
+
+    var events = runner.runAsync("user", session.id(), callerMessage, saveInputBlobs(true)).test();
+
+    assertAgentReplied(events);
+    assertThat(artifactNames()).isEmpty();
+    List<Part> appended = appendedUserParts();
+    assertThat(appended).hasSize(1);
+    assertThat(appended.get(0).text()).hasValue("hello");
+    assertThat(callerMessage.parts().get().get(0).text()).hasValue("hello");
+  }
+
+  @Test
+  public void saveInputBlobsAsArtifacts_disabledWithTextOnlyMessage_passesThroughUnchanged() {
+    // The default path for every ordinary agent call: no blob, and the option at its default false.
+    // The runner must not touch the message at all.
+    useRunnerWithArtifactService();
+    Content callerMessage = Content.fromParts(Part.fromText("hello"));
+
+    var events = runner.runAsync("user", session.id(), callerMessage, saveInputBlobs(false)).test();
+
+    assertAgentReplied(events);
+    assertThat(artifactNames()).isEmpty();
+    List<Part> appended = appendedUserParts();
+    assertThat(appended).hasSize(1);
+    assertThat(appended.get(0).text()).hasValue("hello");
+    assertThat(callerMessage.parts().get().get(0).text()).hasValue("hello");
+  }
+
+  @Test
+  public void saveInputBlobsAsArtifacts_disabled_keepsBlobAndSavesNothing() {
+    useRunnerWithArtifactService();
+
+    var events =
+        runner
+            .runAsync("user", session.id(), immutablePartsMessage(), saveInputBlobs(false))
+            .test();
+
+    assertAgentReplied(events);
+    assertThat(artifactNames()).isEmpty();
+    assertThat(appendedUserParts().get(1).inlineData()).isPresent();
+  }
+
+  @Test
+  public void saveInputBlobsAsArtifacts_fromPartsConstruction_savesArtifactAndCompletes() {
+    useRunnerWithArtifactService();
+    Content fromPartsMessage = Content.fromParts(Part.fromText("hello"), blobPart());
+
+    var events =
+        runner.runAsync("user", session.id(), fromPartsMessage, saveInputBlobs(true)).test();
+
+    assertAgentReplied(events);
+    assertThat(artifactNames()).hasSize(1);
+    List<Part> appended = appendedUserParts();
+    assertThat(appended).hasSize(2);
+    assertThat(appended.get(1).inlineData()).isEmpty();
+    assertThat(appended.get(1).text()).hasValue(placeholderFor(artifactNames().get(0)));
+  }
+
+  @Test
+  public void runAsync_partialEvent_streamedButNotPassedToSessionService() {
+    // The model streams a partial event followed by the final aggregated event in one turn.
+    LlmResponse partialResponse =
+        LlmResponse.builder()
+            .content(Content.builder().role("model").parts(Part.fromText("partial")).build())
+            .partial(true)
+            .build();
+    LlmResponse finalResponse =
+        LlmResponse.builder()
+            .content(Content.builder().role("model").parts(Part.fromText("final")).build())
+            .build();
+    TestLlm testLlm = new TestLlm(() -> Flowable.just(partialResponse, finalResponse));
+    LlmAgent agent = createTestAgent(testLlm);
+    RecordingSessionService sessionService = new RecordingSessionService();
+    Runner runner =
+        Runner.builder()
+            .app(App.builder().name("test").rootAgent(agent).build())
+            .sessionService(sessionService)
+            .build();
+    Session session = sessionService.createSession("test", "user").blockingGet();
+
+    List<Event> events =
+        runner.runAsync("user", session.id(), createContent("hi")).toList().blockingGet();
+
+    // The partial event is still streamed to the caller.
+    assertThat(events.stream().anyMatch(event -> event.partial().orElse(false))).isTrue();
+    // Mirroring ADK Python's Runner, partial events are never handed to the session service, so
+    // managed services (e.g. VertexAiSessionService) cannot persist duplicates.
+    assertThat(sessionService.appendedEvents.stream().anyMatch(e -> e.partial().orElse(false)))
+        .isFalse();
+  }
+
+  /** A session service that records every event passed to {@code appendEvent} for assertions. */
+  private static final class RecordingSessionService implements BaseSessionService {
+    private final InMemorySessionService delegate = new InMemorySessionService();
+    final List<Event> appendedEvents = Collections.synchronizedList(new ArrayList<>());
+
+    @Override
+    public Single<Event> appendEvent(Session session, Event event) {
+      appendedEvents.add(event);
+      return delegate.appendEvent(session, event);
+    }
+
+    // BaseSessionService's only abstract createSession overload is deprecated, so implementing and
+    // delegating to it is unavoidable.
+    @SuppressWarnings("deprecation")
+    @Override
+    public Single<Session> createSession(
+        String appName,
+        String userId,
+        @Nullable ConcurrentMap<String, Object> state,
+        @Nullable String sessionId) {
+      return delegate.createSession(appName, userId, state, sessionId);
+    }
+
+    @Override
+    public Maybe<Session> getSession(
+        String appName, String userId, String sessionId, Optional<GetSessionConfig> config) {
+      return delegate.getSession(appName, userId, sessionId, config);
+    }
+
+    @Override
+    public Single<ListSessionsResponse> listSessions(String appName, String userId) {
+      return delegate.listSessions(appName, userId);
+    }
+
+    @Override
+    public Completable deleteSession(String appName, String userId, String sessionId) {
+      return delegate.deleteSession(appName, userId, sessionId);
+    }
+
+    @Override
+    public Single<ListEventsResponse> listEvents(String appName, String userId, String sessionId) {
+      return delegate.listEvents(appName, userId, sessionId);
+    }
   }
 }
