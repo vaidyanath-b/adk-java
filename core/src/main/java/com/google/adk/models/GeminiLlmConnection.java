@@ -120,13 +120,21 @@ public final class GeminiLlmConnection implements BaseLlmConnection {
 
     logger.debug("Received server message: {}", message.toJson());
 
-    Optional<LlmResponse> llmResponse = convertToServerResponse(message);
+    Optional<LlmResponse> llmResponse = convertToServerResponse(message, modelName);
     llmResponse.ifPresent(responseProcessor::onNext);
   }
 
-  /** Converts a server message into the standardized LlmResponse format. */
-  static Optional<LlmResponse> convertToServerResponse(LiveServerMessage message) {
-    LlmResponse.Builder builder = LlmResponse.builder();
+  /**
+   * Converts a server message into the standardized LlmResponse format.
+   *
+   * <p>{@code LiveServerMessage} does not carry a model id (unlike {@code
+   * GenerateContentResponse.modelVersion}), so the connection stamps the known live endpoint name
+   * onto every emitted response. That keeps BIDI/usage events consistent with non-live flows for
+   * token logging and analytics.
+   */
+  static Optional<LlmResponse> convertToServerResponse(
+      LiveServerMessage message, String modelName) {
+    LlmResponse.Builder builder = LlmResponse.builder().modelVersion(modelName);
     boolean hasRelevantData = false;
 
     if (message.serverContent().isPresent()) {
