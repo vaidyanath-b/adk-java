@@ -570,7 +570,11 @@ public abstract class BaseLlmFlow implements BaseFlow {
     return preprocessEvents.concatWith(
         Flowable.defer(
             () -> {
-              LlmRequest llmRequestAfterPreprocess = llmRequestRef.get();
+              LlmRequest llmRequestAfterPreprocess =
+                  llmRequestRef.get().toBuilder()
+                      .wireObserver(
+                          dev.adk.trace.TraceRegistry.observer(invocationContext.session().id()))
+                      .build();
               if (invocationContext.endInvocation()) {
                 return Flowable.empty();
               }

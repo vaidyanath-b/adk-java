@@ -31,6 +31,9 @@
 
   <dependencies>
     <dependency>
+      <groupId>dev.adk</groupId><artifactId>live-trace</artifactId><version>1.0.0</version>
+    </dependency>
+    <dependency>
       <groupId>com.anthropic</groupId>
       <artifactId>anthropic-java</artifactId>
     </dependency>

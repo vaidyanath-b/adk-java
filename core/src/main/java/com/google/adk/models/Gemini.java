@@ -313,7 +313,8 @@ public class Gemini extends BaseLlm {
     logger.debug("Connecting to model {}", effectiveModelName);
     logger.trace("Connection Config: {}", liveConnectConfig);
 
-    return new GeminiLlmConnection(apiClient, effectiveModelName, liveConnectConfig);
+    return new GeminiLlmConnection(
+        apiClient, effectiveModelName, liveConnectConfig, llmRequest.wireObserver());
   }
 
   private static final class StreamingResponseAggregator {

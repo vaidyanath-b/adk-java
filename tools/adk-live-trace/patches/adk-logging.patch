@@ -1,0 +1,334 @@
+--- a/core/src/main/java/com/google/adk/models/LlmRequest.java
++++ b/core/src/main/java/com/google/adk/models/LlmRequest.java
+@@ -79,6 +79,9 @@
+   @JsonProperty("liveConnectConfig")
+   public abstract LiveConnectConfig liveConnectConfig();
+ 
++  @JsonIgnore
++  public abstract dev.adk.trace.WireObserver wireObserver();
++
+   /**
+    * Returns a map of tools available to the LLM.
+    *
+@@ -113,6 +116,7 @@
+ 
+   public static Builder builder() {
+     return new AutoValue_LlmRequest.Builder()
++        .wireObserver(dev.adk.trace.WireObserver.NONE)
+         .tools(ImmutableMap.of())
+         .contents(ImmutableList.of())
+         .liveConnectConfig(LiveConnectConfig.builder().build());
+@@ -148,6 +152,9 @@
+     public abstract Builder liveConnectConfig(LiveConnectConfig liveConnectConfig);
+ 
+     abstract LiveConnectConfig liveConnectConfig();
++
++    @JsonIgnore
++    public abstract Builder wireObserver(dev.adk.trace.WireObserver observer);
+ 
+     @CanIgnoreReturnValue
+     public abstract Builder tools(Map<String, BaseTool> tools);
+--- a/core/src/main/java/com/google/adk/flows/llmflows/BaseLlmFlow.java
++++ b/core/src/main/java/com/google/adk/flows/llmflows/BaseLlmFlow.java
+@@ -570,7 +570,11 @@
+     return preprocessEvents.concatWith(
+         Flowable.defer(
+             () -> {
+-              LlmRequest llmRequestAfterPreprocess = llmRequestRef.get();
++              LlmRequest llmRequestAfterPreprocess =
++                  llmRequestRef.get().toBuilder()
++                      .wireObserver(
++                          dev.adk.trace.TraceRegistry.observer(invocationContext.session().id()))
++                      .build();
+               if (invocationContext.endInvocation()) {
+                 return Flowable.empty();
+               }
+--- a/core/src/main/java/com/google/adk/models/Gemini.java
++++ b/core/src/main/java/com/google/adk/models/Gemini.java
+@@ -313,7 +313,8 @@
+     logger.debug("Connecting to model {}", effectiveModelName);
+     logger.trace("Connection Config: {}", liveConnectConfig);
+ 
+-    return new GeminiLlmConnection(apiClient, effectiveModelName, liveConnectConfig);
++    return new GeminiLlmConnection(
++        apiClient, effectiveModelName, liveConnectConfig, llmRequest.wireObserver());
+   }
+ 
+   private static final class StreamingResponseAggregator {
+--- a/core/src/main/java/com/google/adk/models/GeminiLlmConnection.java
++++ b/core/src/main/java/com/google/adk/models/GeminiLlmConnection.java
+@@ -79,6 +79,14 @@
+    * @param connectConfig Configuration parameters for the live session.
+    */
+   GeminiLlmConnection(Client apiClient, String modelName, LiveConnectConfig connectConfig) {
++    this(apiClient, modelName, connectConfig, dev.adk.trace.WireObserver.NONE);
++  }
++
++  GeminiLlmConnection(
++      Client apiClient,
++      String modelName,
++      LiveConnectConfig connectConfig,
++      dev.adk.trace.WireObserver observer) {
+     this.apiClient = Objects.requireNonNull(apiClient);
+     this.modelName = Objects.requireNonNull(modelName);
+     this.connectConfig = Objects.requireNonNull(connectConfig);
+@@ -87,7 +95,7 @@
+         this.apiClient
+             .async
+             .live
+-            .connect(this.modelName, this.connectConfig)
++            .connect(this.modelName, this.connectConfig, observer)
+             .whenCompleteAsync(
+                 (session, throwable) -> {
+                   if (throwable != null) {
+@@ -122,7 +130,7 @@
+       return;
+     }
+ 
+-    logger.debug("Received server message: {}", message.toJson());
++    // Full payload debug removed: the SDK wire observer emits a sanitized copy.
+ 
+     Observable<LlmResponse> llmResponse = convertToServerResponse(message);
+     if (!disposables.add(
+--- a/core/src/main/java/com/google/adk/runner/Runner.java
++++ b/core/src/main/java/com/google/adk/runner/Runner.java
+@@ -779,6 +779,10 @@
+     return Flowable.defer(
+         () -> {
+           Context capturedContext = Context.current();
++          dev.adk.trace.LiveTrace trace = dev.adk.trace.TraceRegistry.find(session.id());
++          dev.adk.trace.EventObserver eventObserver =
++              trace == null ? null : new dev.adk.trace.EventObserver(trace);
++          dev.adk.trace.TraceRegistry.event(session.id(), "RUN.LIVE_BEGIN");
+           InvocationContext invocationContext =
+               newInvocationContextForLive(session, liveRequestQueue, runConfig);
+ 
+@@ -801,6 +805,10 @@
+                       updatedInvocationContext
+                           .agent()
+                           .runLive(updatedInvocationContext)
++                          .doOnNext(
++                              event -> {
++                                if (eventObserver != null) eventObserver.accept(event.toJson());
++                              })
+                           .concatMapSingle(
+                               event ->
+                                   this.sessionService
+--- a/core/src/main/java/com/google/adk/sessions/PostgresSessionService.java
++++ b/core/src/main/java/com/google/adk/sessions/PostgresSessionService.java
+@@ -115,6 +115,7 @@
+         "Attempting to get session: {} for app: {} and user: {}", sessionId, appName, userId);
+ 
+     try {
++      dev.adk.trace.TraceRegistry.event(sessionId, "SESSION.LOAD.BEGIN");
+       JSONObject storedSessionJson = getSessionFromRedisOrPostgres(sessionId);
+       if (storedSessionJson != null) {
+         // Deserialize the JSONObject back into a Session object using ObjectMapper
+@@ -133,12 +134,17 @@
+         }
+ 
+         logger.info("Session {} retrieved successfully.", sessionId);
++        dev.adk.trace.TraceRegistry.event(
++            sessionId, "SESSION.LOAD.RETURNED", "eventCount", session.events().size());
++        dev.adk.trace.TraceRegistry.json(
++            sessionId, "SESSION.STATE_LOADED", objectMapper.writeValueAsString(session.state()));
+         return Maybe.just(this.copySession(session));
+       } else {
+         logger.debug("Session {} not found.", sessionId);
+         return Maybe.empty();
+       }
+     } catch (Exception ex) {
++      dev.adk.trace.TraceRegistry.error(sessionId, "SESSION.LOAD.FAILED", ex);
+       logger.error("Error getting session {}: {}", sessionId, ex.getMessage(), ex);
+       return Maybe.error(new RuntimeException("Failed to get session: " + sessionId, ex));
+     }
+@@ -227,6 +233,7 @@
+     Objects.requireNonNull(session.id(), "session.id cannot be null");
+ 
+     String sessionId = session.id();
++    dev.adk.trace.TraceRegistry.json(sessionId, "SESSION.APPEND.BEGIN", event.toJson());
+     logger.debug("Attempting to append event to session: {}", sessionId);
+ 
+     try {
+@@ -285,7 +292,16 @@
+            * This will handle both insert and update (upsert) logic.
+            */
+ 
++          dev.adk.trace.TraceRegistry.json(
++              sessionId,
++              "STATE.SAVE_REQUEST",
++              objectMapper.writeValueAsString(updatedSession.state()));
+           PostgresDBHelper.getInstance().saveSession(sessionId, updatedSession);
++          dev.adk.trace.TraceRegistry.event(
++              sessionId,
++              "STATE.SAVE_RETURNED",
++              "durability",
++              "inspect JDBC commit records; helper may swallow errors");
+ 
+           logger.debug("Event appended successfully to session {} with state updates.", sessionId);
+           // Call super implementation to update the in-memory session object as well
+@@ -297,6 +313,7 @@
+         }
+       }
+     } catch (Exception ex) {
++      dev.adk.trace.TraceRegistry.error(sessionId, "SESSION.APPEND.FAILED", ex);
+       logger.error("Error appending event to session {}: {}", sessionId, ex.getMessage(), ex);
+       return Single.error(
+           new RuntimeException("Failed to append event to session: " + sessionId, ex));
+@@ -349,7 +366,13 @@
+     String redisSessionStr = null;
+     String useRedis = PropertiesHelper.getInstance().getValue("use_redis");
+     if (Boolean.parseBoolean(useRedis)) {
++      dev.adk.trace.TraceRegistry.event(sessionId, "CACHE.GET.BEGIN");
+       redisSessionStr = redisConnection.get(sessionId);
++      dev.adk.trace.TraceRegistry.event(
++          sessionId,
++          "CACHE.GET.RETURNED",
++          "hit",
++          redisSessionStr != null && !redisSessionStr.isEmpty());
+     }
+     if (redisSessionStr != null && !redisSessionStr.isEmpty()) {
+       JSONObject redisSessionJson = new JSONObject(redisSessionStr);
+--- a/core/src/main/java/com/google/adk/utils/PostgresDBHelper.java
++++ b/core/src/main/java/com/google/adk/utils/PostgresDBHelper.java
+@@ -111,6 +111,11 @@
+     return createConnection();
+   }
+ 
++  private static Connection traceConnection(Connection connection, String sessionId) {
++    dev.adk.trace.LiveTrace trace = dev.adk.trace.TraceRegistry.find(sessionId);
++    return trace == null ? connection : dev.adk.trace.JdbcTrace.wrap(connection, trace);
++  }
++
+   /**
+    * Saves a session to the PostgreSQL database. This method acts as an upsert (INSERT if not
+    * exists, UPDATE if exists). It parses the incoming session JSON string to extract fields and
+@@ -133,8 +138,15 @@
+     if (Boolean.parseBoolean(useRedis)) {
+       saveToRedisCache(session, eventJson);
+     }
++    dev.adk.trace.TraceRegistry.event(
++        sessionId,
++        "STORAGE.ROUTE",
++        "redisEnabled",
++        Boolean.parseBoolean(useRedis),
++        "directPostgresEnabled",
++        !Boolean.parseBoolean(useKafka));
+     if (!Boolean.parseBoolean(useKafka)) {
+-      try (Connection conn = this.createConnection()) {
++      try (Connection conn = traceConnection(this.createConnection(), sessionId)) {
+         conn.setAutoCommit(false); // Start transaction
+ 
+         // Upsert the main session data
+@@ -270,10 +282,12 @@
+         if (conn != null && !conn.isClosed()) {
+           conn.rollback();
+         }
++        dev.adk.trace.TraceRegistry.error(session.id(), "DB.INSERT_EVENTS.ERROR_SWALLOWED", ex);
+         // throw ex;
+       }
+ 
+     } catch (Exception e) {
++      dev.adk.trace.TraceRegistry.error(session.id(), "DB.INSERT_EVENTS.OUTER_ERROR_SWALLOWED", e);
+       e.printStackTrace();
+     }
+   }
+@@ -294,7 +308,9 @@
+           (double) session.lastUpdateTime().getEpochSecond()
+               + session.lastUpdateTime().getNano() / 1_000_000_000.0);
+ 
++      dev.adk.trace.TraceRegistry.event(session.id(), "CACHE.SET.BEGIN");
+       String cacheResult = redisConnection.set(session.id(), sessionJson.toString());
++      dev.adk.trace.TraceRegistry.event(session.id(), "CACHE.SET.RETURNED", "result", cacheResult);
+       logger.debug(
+           "Redis cache update for session {}: {}",
+           session.id(),
+@@ -332,7 +348,7 @@
+             + " WHERE id = ?";
+     JSONObject sessionJson = null;
+ 
+-    try (Connection conn = PostgresDBHelper.getInstance().createConnection();
++    try (Connection conn = traceConnection(PostgresDBHelper.getInstance().createConnection(), id);
+         PreparedStatement pstmt = conn.prepareStatement(sql)) {
+ 
+       pstmt.setString(1, id);
+--- a/dev/src/main/java/com/google/adk/web/websocket/LiveWebSocketHandler.java
++++ b/dev/src/main/java/com/google/adk/web/websocket/LiveWebSocketHandler.java
+@@ -127,6 +127,9 @@
+         userId,
+         sessionId);
+ 
++    wsSession.getAttributes().put("traceSessionId", sessionId);
++    dev.adk.trace.TraceRegistry.event(
++        sessionId, "FRONTEND.WS.OPEN", "app", appName, "user", userId);
+     RunConfig runConfig =
+         RunConfig.builder()
+             .setResponseModalities(ImmutableList.of(new Modality(Modality.Known.AUDIO)))
+@@ -184,7 +187,11 @@
+                     String jsonEvent = objectMapper.writeValueAsString(event);
+                     log.debug(
+                         "Sending event via WebSocket session {}: {}", wsSession.getId(), jsonEvent);
++                    dev.adk.trace.TraceRegistry.json(
++                        sessionId, "FRONTEND.OUT.EVENT.ATTEMPT", jsonEvent);
+                     wsSession.sendMessage(new TextMessage(jsonEvent));
++                    dev.adk.trace.TraceRegistry.event(
++                        sessionId, "FRONTEND.OUT.EVENT.DISPATCH_RETURNED");
+                   } catch (JsonProcessingException e) {
+                     log.error(
+                         "Error serializing event to JSON for WebSocket session {}",
+@@ -260,7 +267,20 @@
+       String payload = message.getPayload();
+       log.debug("Received text message on WebSocket session {}: {}", wsSession.getId(), payload);
+ 
++      String traceSessionId = (String) wsSession.getAttributes().getOrDefault("traceSessionId", "");
++      dev.adk.trace.TraceRegistry.json(traceSessionId, "FRONTEND.IN.MESSAGE", payload);
+       JsonNode rootNode = objectMapper.readTree(payload);
++      if (rootNode.has("trace")) {
++        JsonNode telemetry = rootNode.get("trace");
++        String kind = telemetry.path("kind").asText("");
++        if (telemetry.isObject()
++            && kind.matches(
++                "(?:PLAYBACK\\.RESET|TRANSCRIPT\\.TRUNCATE|INTERRUPTION\\.RECEIVED|VAD\\.LOCAL_START)(?:\\.(?:BEGIN|RETURNED|FAILED))?")) {
++          dev.adk.trace.TraceRegistry.json(
++              traceSessionId, "CLIENT.REPORTED." + kind, telemetry.toString());
++        }
++        return; // Client telemetry is never forwarded to Gemini or converted into a close request.
++      }
+       LiveRequest.Builder liveRequestBuilder = LiveRequest.builder();
+ 
+       if (rootNode.has("content")) {
+@@ -338,6 +358,11 @@
+       throws Exception {
+     log.info(
+         "WebSocket connection closed: {} with status {}", wsSession.getId(), status.toString());
++    dev.adk.trace.TraceRegistry.event(
++        (String) wsSession.getAttributes().getOrDefault("traceSessionId", ""),
++        "FRONTEND.WS.CLOSE",
++        "code",
++        status.getCode());
+     cleanupSession(wsSession);
+   }
+ 
+--- a/core/pom.xml
++++ b/core/pom.xml
+@@ -30,6 +30,9 @@
+ 
+ 
+   <dependencies>
++    <dependency>
++      <groupId>dev.adk</groupId><artifactId>live-trace</artifactId><version>1.0.0</version>
++    </dependency>
+     <dependency>
+       <groupId>com.anthropic</groupId>
+       <artifactId>anthropic-java</artifactId>
+--- a/pom.xml
++++ b/pom.xml
+@@ -55,7 +55,7 @@
+     <otel.version>1.51.0</otel.version>
+     <mcp.version>1.1.2</mcp.version>
+     <errorprone.version>2.47.0</errorprone.version>
+-    <google.genai.version>1.58.0</google.genai.version>
++    <google.genai.version>1.58.0-live-trace-SNAPSHOT</google.genai.version>
+     <protobuf.version>4.33.5</protobuf.version>
+     <junit.version>5.11.4</junit.version>
+     <mockito.version>5.23.0</mockito.version>

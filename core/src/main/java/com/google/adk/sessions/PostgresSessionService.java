@@ -115,6 +115,7 @@ public class PostgresSessionService implements BaseSessionService, AutoCloseable
         "Attempting to get session: {} for app: {} and user: {}", sessionId, appName, userId);
 
     try {
+      dev.adk.trace.TraceRegistry.event(sessionId, "SESSION.LOAD.BEGIN");
       JSONObject storedSessionJson = getSessionFromRedisOrPostgres(sessionId);
       if (storedSessionJson != null) {
         // Deserialize the JSONObject back into a Session object using ObjectMapper
@@ -133,12 +134,17 @@ public class PostgresSessionService implements BaseSessionService, AutoCloseable
         }
 
         logger.info("Session {} retrieved successfully.", sessionId);
+        dev.adk.trace.TraceRegistry.event(
+            sessionId, "SESSION.LOAD.RETURNED", "eventCount", session.events().size());
+        dev.adk.trace.TraceRegistry.json(
+            sessionId, "SESSION.STATE_LOADED", objectMapper.writeValueAsString(session.state()));
         return Maybe.just(this.copySession(session));
       } else {
         logger.debug("Session {} not found.", sessionId);
         return Maybe.empty();
       }
     } catch (Exception ex) {
+      dev.adk.trace.TraceRegistry.error(sessionId, "SESSION.LOAD.FAILED", ex);
       logger.error("Error getting session {}: {}", sessionId, ex.getMessage(), ex);
       return Maybe.error(new RuntimeException("Failed to get session: " + sessionId, ex));
     }
@@ -227,6 +233,7 @@ public class PostgresSessionService implements BaseSessionService, AutoCloseable
     Objects.requireNonNull(session.id(), "session.id cannot be null");
 
     String sessionId = session.id();
+    dev.adk.trace.TraceRegistry.json(sessionId, "SESSION.APPEND.BEGIN", event.toJson());
     logger.debug("Attempting to append event to session: {}", sessionId);
 
     try {
@@ -285,7 +292,16 @@ public class PostgresSessionService implements BaseSessionService, AutoCloseable
            * This will handle both insert and update (upsert) logic.
            */
 
+          dev.adk.trace.TraceRegistry.json(
+              sessionId,
+              "STATE.SAVE_REQUEST",
+              objectMapper.writeValueAsString(updatedSession.state()));
           PostgresDBHelper.getInstance().saveSession(sessionId, updatedSession);
+          dev.adk.trace.TraceRegistry.event(
+              sessionId,
+              "STATE.SAVE_RETURNED",
+              "durability",
+              "inspect JDBC commit records; helper may swallow errors");
 
           logger.debug("Event appended successfully to session {} with state updates.", sessionId);
           // Call super implementation to update the in-memory session object as well
@@ -297,6 +313,7 @@ public class PostgresSessionService implements BaseSessionService, AutoCloseable
         }
       }
     } catch (Exception ex) {
+      dev.adk.trace.TraceRegistry.error(sessionId, "SESSION.APPEND.FAILED", ex);
       logger.error("Error appending event to session {}: {}", sessionId, ex.getMessage(), ex);
       return Single.error(
           new RuntimeException("Failed to append event to session: " + sessionId, ex));
@@ -349,7 +366,13 @@ public class PostgresSessionService implements BaseSessionService, AutoCloseable
     String redisSessionStr = null;
     String useRedis = PropertiesHelper.getInstance().getValue("use_redis");
     if (Boolean.parseBoolean(useRedis)) {
+      dev.adk.trace.TraceRegistry.event(sessionId, "CACHE.GET.BEGIN");
       redisSessionStr = redisConnection.get(sessionId);
+      dev.adk.trace.TraceRegistry.event(
+          sessionId,
+          "CACHE.GET.RETURNED",
+          "hit",
+          redisSessionStr != null && !redisSessionStr.isEmpty());
     }
     if (redisSessionStr != null && !redisSessionStr.isEmpty()) {
       JSONObject redisSessionJson = new JSONObject(redisSessionStr);

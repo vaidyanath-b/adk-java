@@ -79,6 +79,9 @@ public abstract class LlmRequest extends JsonBaseModel {
   @JsonProperty("liveConnectConfig")
   public abstract LiveConnectConfig liveConnectConfig();
 
+  @JsonIgnore
+  public abstract dev.adk.trace.WireObserver wireObserver();
+
   /**
    * Returns a map of tools available to the LLM.
    *
@@ -113,6 +116,7 @@ public abstract class LlmRequest extends JsonBaseModel {
 
   public static Builder builder() {
     return new AutoValue_LlmRequest.Builder()
+        .wireObserver(dev.adk.trace.WireObserver.NONE)
         .tools(ImmutableMap.of())
         .contents(ImmutableList.of())
         .liveConnectConfig(LiveConnectConfig.builder().build());
@@ -148,6 +152,9 @@ public abstract class LlmRequest extends JsonBaseModel {
     public abstract Builder liveConnectConfig(LiveConnectConfig liveConnectConfig);
 
     abstract LiveConnectConfig liveConnectConfig();
+
+    @JsonIgnore
+    public abstract Builder wireObserver(dev.adk.trace.WireObserver observer);
 
     @CanIgnoreReturnValue
     public abstract Builder tools(Map<String, BaseTool> tools);

@@ -111,6 +111,11 @@ public class PostgresDBHelper {
     return createConnection();
   }
 
+  private static Connection traceConnection(Connection connection, String sessionId) {
+    dev.adk.trace.LiveTrace trace = dev.adk.trace.TraceRegistry.find(sessionId);
+    return trace == null ? connection : dev.adk.trace.JdbcTrace.wrap(connection, trace);
+  }
+
   /**
    * Saves a session to the PostgreSQL database. This method acts as an upsert (INSERT if not
    * exists, UPDATE if exists). It parses the incoming session JSON string to extract fields and
@@ -133,8 +138,15 @@ public class PostgresDBHelper {
     if (Boolean.parseBoolean(useRedis)) {
       saveToRedisCache(session, eventJson);
     }
+    dev.adk.trace.TraceRegistry.event(
+        sessionId,
+        "STORAGE.ROUTE",
+        "redisEnabled",
+        Boolean.parseBoolean(useRedis),
+        "directPostgresEnabled",
+        !Boolean.parseBoolean(useKafka));
     if (!Boolean.parseBoolean(useKafka)) {
-      try (Connection conn = this.createConnection()) {
+      try (Connection conn = traceConnection(this.createConnection(), sessionId)) {
         conn.setAutoCommit(false); // Start transaction
 
         // Upsert the main session data
@@ -270,10 +282,12 @@ public class PostgresDBHelper {
         if (conn != null && !conn.isClosed()) {
           conn.rollback();
         }
+        dev.adk.trace.TraceRegistry.error(session.id(), "DB.INSERT_EVENTS.ERROR_SWALLOWED", ex);
         // throw ex;
       }
 
     } catch (Exception e) {
+      dev.adk.trace.TraceRegistry.error(session.id(), "DB.INSERT_EVENTS.OUTER_ERROR_SWALLOWED", e);
       e.printStackTrace();
     }
   }
@@ -294,7 +308,9 @@ public class PostgresDBHelper {
           (double) session.lastUpdateTime().getEpochSecond()
               + session.lastUpdateTime().getNano() / 1_000_000_000.0);
 
+      dev.adk.trace.TraceRegistry.event(session.id(), "CACHE.SET.BEGIN");
       String cacheResult = redisConnection.set(session.id(), sessionJson.toString());
+      dev.adk.trace.TraceRegistry.event(session.id(), "CACHE.SET.RETURNED", "result", cacheResult);
       logger.debug(
           "Redis cache update for session {}: {}",
           session.id(),
@@ -332,7 +348,7 @@ public class PostgresDBHelper {
             + " WHERE id = ?";
     JSONObject sessionJson = null;
 
-    try (Connection conn = PostgresDBHelper.getInstance().createConnection();
+    try (Connection conn = traceConnection(PostgresDBHelper.getInstance().createConnection(), id);
         PreparedStatement pstmt = conn.prepareStatement(sql)) {
 
       pstmt.setString(1, id);

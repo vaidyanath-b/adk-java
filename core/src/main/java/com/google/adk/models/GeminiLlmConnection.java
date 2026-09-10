@@ -79,6 +79,14 @@ public final class GeminiLlmConnection implements BaseLlmConnection {
    * @param connectConfig Configuration parameters for the live session.
    */
   GeminiLlmConnection(Client apiClient, String modelName, LiveConnectConfig connectConfig) {
+    this(apiClient, modelName, connectConfig, dev.adk.trace.WireObserver.NONE);
+  }
+
+  GeminiLlmConnection(
+      Client apiClient,
+      String modelName,
+      LiveConnectConfig connectConfig,
+      dev.adk.trace.WireObserver observer) {
     this.apiClient = Objects.requireNonNull(apiClient);
     this.modelName = Objects.requireNonNull(modelName);
     this.connectConfig = Objects.requireNonNull(connectConfig);
@@ -87,7 +95,7 @@ public final class GeminiLlmConnection implements BaseLlmConnection {
         this.apiClient
             .async
             .live
-            .connect(this.modelName, this.connectConfig)
+            .connect(this.modelName, this.connectConfig, observer)
             .whenCompleteAsync(
                 (session, throwable) -> {
                   if (throwable != null) {
@@ -122,7 +130,7 @@ public final class GeminiLlmConnection implements BaseLlmConnection {
       return;
     }
 
-    logger.debug("Received server message: {}", message.toJson());
+    // Full payload debug removed: the SDK wire observer emits a sanitized copy.
 
     Observable<LlmResponse> llmResponse = convertToServerResponse(message);
     if (!disposables.add(

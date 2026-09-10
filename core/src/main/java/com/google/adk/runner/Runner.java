@@ -779,6 +779,10 @@ public class Runner {
     return Flowable.defer(
         () -> {
           Context capturedContext = Context.current();
+          dev.adk.trace.LiveTrace trace = dev.adk.trace.TraceRegistry.find(session.id());
+          dev.adk.trace.EventObserver eventObserver =
+              trace == null ? null : new dev.adk.trace.EventObserver(trace);
+          dev.adk.trace.TraceRegistry.event(session.id(), "RUN.LIVE_BEGIN");
           InvocationContext invocationContext =
               newInvocationContextForLive(session, liveRequestQueue, runConfig);
 
@@ -801,6 +805,10 @@ public class Runner {
                       updatedInvocationContext
                           .agent()
                           .runLive(updatedInvocationContext)
+                          .doOnNext(
+                              event -> {
+                                if (eventObserver != null) eventObserver.accept(event.toJson());
+                              })
                           .concatMapSingle(
                               event ->
                                   this.sessionService

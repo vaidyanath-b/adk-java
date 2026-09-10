@@ -1,0 +1,194 @@
+--- a/src/main/java/com/google/genai/AsyncLive.java
++++ b/src/main/java/com/google/genai/AsyncLive.java
+@@ -18,6 +18,7 @@
+ 
+ import static java.nio.charset.StandardCharsets.UTF_8;
+ 
++import dev.adk.trace.WireObserver;
+ import com.fasterxml.jackson.databind.JsonNode;
+ import com.fasterxml.jackson.databind.node.ObjectNode;
+ import com.google.auth.oauth2.GoogleCredentials;
+@@ -64,6 +65,10 @@
+    *     connection.
+    */
+   public CompletableFuture<AsyncSession> connect(String model, LiveConnectConfig config) {
++    return connect(model, config, WireObserver.NONE);
++  }
++
++  public CompletableFuture<AsyncSession> connect(String model, LiveConnectConfig config, WireObserver observer) {
+     // TODO: b/404946806 - Support per request HTTP options.
+     if (config != null && config.httpOptions().isPresent()) {
+       throw new IllegalArgumentException(
+@@ -78,8 +83,9 @@
+             getWebSocketHeaders(),
+             getSetupRequest(model, config),
+             future,
+-            apiClient);
+-
++            apiClient, observer);
++
++    observer.message("WS.CONNECT_BEGIN", "{}");
+     websocket.connect();
+ 
+     return future;
+@@ -212,6 +218,7 @@
+   }
+ 
+   static class GenAiWebSocketClient extends WebSocketClient {
++    private final WireObserver observer;
+     private final String setupRequest;
+     private final CompletableFuture<AsyncSession> sessionFuture;
+     private final ApiClient apiClient;
+@@ -223,7 +230,13 @@
+         String setupRequest,
+         CompletableFuture<AsyncSession> sessionFuture,
+         ApiClient apiClient) {
++      this(uri, headers, setupRequest, sessionFuture, apiClient, WireObserver.NONE);
++    }
++
++    public GenAiWebSocketClient(URI uri, Map<String, String> headers, String setupRequest,
++        CompletableFuture<AsyncSession> sessionFuture, ApiClient apiClient, WireObserver observer) {
+       super(uri, headers);
++      this.observer = observer;
+       this.setupRequest = setupRequest;
+       this.sessionFuture = sessionFuture;
+       this.messageCallback = null;
+@@ -236,7 +249,15 @@
+ 
+     @Override
+     public void onOpen(ServerHandshake handshake) {
+-      send(setupRequest);
++      observer.message("WS.OPEN", "{}");
++      observer.message("WIRE.OUT.SETUP.ATTEMPT", setupRequest);
++      try {
++        send(setupRequest);
++        observer.message("WIRE.OUT.SETUP.DISPATCH_RETURNED", "{}");
++      } catch (RuntimeException e) {
++        observer.failure("WIRE.OUT.SETUP.FAILED", e);
++        throw e;
++      }
+     }
+ 
+     @Override
+@@ -257,7 +278,20 @@
+     }
+ 
+     @Override
++    public void onWebsocketPing(org.java_websocket.WebSocket conn, org.java_websocket.framing.Framedata frame) {
++      observer.message("WS.PING", "{\"bytes\":" + frame.getPayloadData().remaining() + "}");
++      super.onWebsocketPing(conn, frame);
++    }
++
++    @Override
++    public void onWebsocketPong(org.java_websocket.WebSocket conn, org.java_websocket.framing.Framedata frame) {
++      observer.message("WS.PONG", "{\"bytes\":" + frame.getPayloadData().remaining() + "}");
++      super.onWebsocketPong(conn, frame);
++    }
++
++    @Override
+     public void onError(Exception ex) {
++      observer.failure("WS.ERROR", ex);
+       logger.log(Level.SEVERE, "Error during live session", ex);
+       if (!sessionFuture.isDone()) {
+         sessionFuture.completeExceptionally(ex);
+@@ -266,6 +300,7 @@
+ 
+     @Override
+     public void onClose(int code, String reason, boolean remote) {
++      observer.message("WS.CLOSE", "{\"code\":" + code + ",\"remote\":" + remote + "}");
+       logger.log(
+           Level.INFO,
+           "Live session closed with code: {0} and reason: {1}",
+@@ -277,6 +312,7 @@
+     }
+ 
+     private void handleIncomingMessage(String message) {
++      observer.message("WIRE.IN.MESSAGE", message);
+       if (!sessionFuture.isDone()) {
+         // For the first message, we know it's the setup response.
+         // We just complete the future and don't handle the message.
+@@ -287,7 +323,7 @@
+                 new AsyncSession(
+                     apiClient,
+                     this,
+-                    initialResponse.setupComplete().get().sessionId().orElse(null)));
++                    initialResponse.setupComplete().get().sessionId().orElse(null), observer));
+           } else {
+             sessionFuture.completeExceptionally(
+                 new GenAiIOException(
+--- a/src/main/java/com/google/genai/AsyncSession.java
++++ b/src/main/java/com/google/genai/AsyncSession.java
+@@ -16,6 +16,7 @@
+ 
+ package com.google.genai;
+ 
++import dev.adk.trace.WireObserver;
+ import com.fasterxml.jackson.databind.JsonNode;
+ import com.fasterxml.jackson.databind.node.ObjectNode;
+ import com.google.genai.types.LiveClientContent;
+@@ -37,11 +38,17 @@
+   @SuppressWarnings("unused")
+   // For future use of converters for different backends.
+   private final ApiClient apiClient;
++  private final WireObserver observer;
+ 
+   private final AsyncLive.GenAiWebSocketClient websocket;
+   final String sessionId;
+ 
+   AsyncSession(ApiClient apiClient, AsyncLive.GenAiWebSocketClient websocket, String sessionId) {
++    this(apiClient, websocket, sessionId, WireObserver.NONE);
++  }
++
++  AsyncSession(ApiClient apiClient, AsyncLive.GenAiWebSocketClient websocket, String sessionId, WireObserver observer) {
++    this.observer = observer;
+     this.apiClient = apiClient;
+     this.websocket = websocket;
+     this.sessionId = sessionId;
+@@ -107,7 +114,17 @@
+       body = liveConverters.liveClientMessageToMldev(parameterNode, null);
+     }
+ 
+-    return CompletableFuture.runAsync(() -> websocket.send(JsonSerializable.toJsonString(body)));
++    String serialized = JsonSerializable.toJsonString(body);
++    return CompletableFuture.runAsync(() -> {
++      observer.message("WIRE.OUT.MESSAGE.ATTEMPT", serialized);
++      try {
++        websocket.send(serialized);
++        observer.message("WIRE.OUT.MESSAGE.DISPATCH_RETURNED", "{}");
++      } catch (RuntimeException e) {
++        observer.failure("WIRE.OUT.MESSAGE.FAILED", e);
++        throw e;
++      }
++    });
+   }
+ 
+   /**
+@@ -133,6 +150,7 @@
+   public CompletableFuture<Void> close() {
+     return CompletableFuture.runAsync(
+         () -> {
++          observer.message("WS.CLOSE_REQUESTED", "{}");
+           websocket.close();
+         });
+   }
+--- a/pom.xml
++++ b/pom.xml
+@@ -6,7 +6,7 @@
+   <groupId>com.google.genai</groupId>
+   <artifactId>google-genai</artifactId>
+   <name>google-genai</name>
+-  <version>1.58.0</version><!-- {x-version-update:google-genai:current} -->
++  <version>1.58.0-live-trace-SNAPSHOT</version><!-- {x-version-update:google-genai:current} -->
+   <packaging>jar</packaging>
+   <description>
+     Java idiomatic SDK for the Gemini Developer APIs and Vertex AI APIs.
+@@ -83,6 +83,9 @@
+   </dependencyManagement>
+ 
+   <dependencies>
++    <dependency>
++      <groupId>dev.adk</groupId><artifactId>live-trace</artifactId><version>1.0.0</version>
++    </dependency>
+     <dependency>
+       <groupId>com.google.auth</groupId>
+       <artifactId>google-auth-library-oauth2-http</artifactId>

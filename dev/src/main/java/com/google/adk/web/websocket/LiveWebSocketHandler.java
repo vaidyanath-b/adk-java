@@ -127,6 +127,9 @@ public class LiveWebSocketHandler extends TextWebSocketHandler {
         userId,
         sessionId);
 
+    wsSession.getAttributes().put("traceSessionId", sessionId);
+    dev.adk.trace.TraceRegistry.event(
+        sessionId, "FRONTEND.WS.OPEN", "app", appName, "user", userId);
     RunConfig runConfig =
         RunConfig.builder()
             .setResponseModalities(ImmutableList.of(new Modality(Modality.Known.AUDIO)))
@@ -184,7 +187,11 @@ public class LiveWebSocketHandler extends TextWebSocketHandler {
                     String jsonEvent = objectMapper.writeValueAsString(event);
                     log.debug(
                         "Sending event via WebSocket session {}: {}", wsSession.getId(), jsonEvent);
+                    dev.adk.trace.TraceRegistry.json(
+                        sessionId, "FRONTEND.OUT.EVENT.ATTEMPT", jsonEvent);
                     wsSession.sendMessage(new TextMessage(jsonEvent));
+                    dev.adk.trace.TraceRegistry.event(
+                        sessionId, "FRONTEND.OUT.EVENT.DISPATCH_RETURNED");
                   } catch (JsonProcessingException e) {
                     log.error(
                         "Error serializing event to JSON for WebSocket session {}",
@@ -260,7 +267,20 @@ public class LiveWebSocketHandler extends TextWebSocketHandler {
       String payload = message.getPayload();
       log.debug("Received text message on WebSocket session {}: {}", wsSession.getId(), payload);
 
+      String traceSessionId = (String) wsSession.getAttributes().getOrDefault("traceSessionId", "");
+      dev.adk.trace.TraceRegistry.json(traceSessionId, "FRONTEND.IN.MESSAGE", payload);
       JsonNode rootNode = objectMapper.readTree(payload);
+      if (rootNode.has("trace")) {
+        JsonNode telemetry = rootNode.get("trace");
+        String kind = telemetry.path("kind").asText("");
+        if (telemetry.isObject()
+            && kind.matches(
+                "(?:PLAYBACK\\.RESET|TRANSCRIPT\\.TRUNCATE|INTERRUPTION\\.RECEIVED|VAD\\.LOCAL_START)(?:\\.(?:BEGIN|RETURNED|FAILED))?")) {
+          dev.adk.trace.TraceRegistry.json(
+              traceSessionId, "CLIENT.REPORTED." + kind, telemetry.toString());
+        }
+        return; // Client telemetry is never forwarded to Gemini or converted into a close request.
+      }
       LiveRequest.Builder liveRequestBuilder = LiveRequest.builder();
 
       if (rootNode.has("content")) {
@@ -338,6 +358,11 @@ public class LiveWebSocketHandler extends TextWebSocketHandler {
       throws Exception {
     log.info(
         "WebSocket connection closed: {} with status {}", wsSession.getId(), status.toString());
+    dev.adk.trace.TraceRegistry.event(
+        (String) wsSession.getAttributes().getOrDefault("traceSessionId", ""),
+        "FRONTEND.WS.CLOSE",
+        "code",
+        status.getCode());
     cleanupSession(wsSession);
   }
 
